@@ -4,6 +4,7 @@
 output/output_world.blend
 output/output_world.blend[0-9]*
 output/previews/
+output/v2_previews/
 output/render/
 output/backups/
 

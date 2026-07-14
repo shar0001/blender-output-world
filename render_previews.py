@@ -3,9 +3,9 @@
 """render_previews.py
 
 保存済みの output/output_world.blend（または現在開いているシーン）に対して、
-3カメラ（CAM_06 / CAM_07 / CAM_08）の静止画プレビューを output/previews/ に
-書き出す軽量スクリプト。build_output_world.py を再実行せずにプレビューだけを
-更新したいときに使う。
+3カメラ（CAM_06 / CAM_07 / CAM_08）の静止画プレビューを output/v2_previews/ に
+書き出す軽量スクリプト（暖かいアイボリー背景・960×540）。
+build_output_world.py を再実行せずにプレビューだけを更新したいときに使う。
 
 使い方（macOS ターミナル・ヘッドレス）::
 
@@ -59,8 +59,8 @@ def main() -> None:
         )
 
     bow.setup_scene_base(cfg)
-    saved = bow.render_previews(cfg, dirs)
-    bow.log.info("プレビュー %d 枚を保存しました:", len(saved))
+    saved = bow.render_v2_previews(cfg, dirs)
+    bow.log.info("V2プレビュー %d 枚を保存しました:", len(saved))
     for p in saved:
         bow.log.info("  - %s", p)
 

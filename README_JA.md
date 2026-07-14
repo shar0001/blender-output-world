@@ -43,10 +43,21 @@
 ```
 output/
 ├── output_world.blend      # 保存されたシーン
-├── previews/               # 3カメラの静止画プレビュー
+├── previews/               # (旧) 3カメラの静止画プレビュー
+├── v2_previews/            # V2 プレビュー（アイボリー背景・960×540）
 ├── render/                 # ショット別の連番出力先
 └── backups/                # 実行前の .blend バックアップ
 ```
+
+> **v2 での主な変更**
+> - ブロックマテリアルを **`OW_SourceCube`** の mesh へ割り当て（インスタンスが
+>   正しくコバルトブルー/レッドを継承。以前はフィールド側に付けていたため
+>   グレー表示だった）。
+> - 3つの非対称ピーク + 低/中周波ノイズ + 前中後の高さリズム、生成波に
+>   オーバーシュートと時間差、DIVE 用の低ブロック「データチャネル」、
+>   フィールドをグリッド軸から約7°回転。
+> - プレビューは暖かいアイボリー背景（最終レンダーは背景透過のまま）。
+> - Blender 5.1.2 のスロット化 Action（Layer/Strip/Channelbag）対応。
 
 ---
 
@@ -203,5 +214,5 @@ BLENDER=/Applications/Blender.app/Contents/MacOS/Blender
 "$BLENDER" -b output/output_world.blend -P render_previews.py
 ```
 
-生成された静止画は `output/previews/OW_CAM_06_EMERGENCE.png` などとして
+生成された静止画は `output/v2_previews/OW_CAM_06_EMERGENCE.png` などとして
 保存されます（背景透過 PNG）。
