@@ -1,0 +1,15 @@
+# Rendered output images
+/output/*.png
+/output/*.jpg
+/output/*.jpeg
+!/output/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Blender
+*.blend1
+*.blend2

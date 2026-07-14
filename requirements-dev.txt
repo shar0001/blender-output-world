@@ -1,0 +1,4 @@
+# Development-only stubs. Blender ships its own bundled Python + bpy at
+# runtime, so these are NOT required to run the generator inside Blender.
+# They provide `bpy` autocompletion / type checking in a normal editor.
+fake-bpy-module-latest
