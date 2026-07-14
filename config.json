@@ -1,0 +1,17 @@
+{
+  "grid_x": 32,
+  "grid_y": 32,
+  "spacing": 1.0,
+  "min_height": 0.4,
+  "max_height": 9.0,
+  "noise_scale": 2.2,
+  "noise_strength": 1.0,
+  "center_peak_strength": 1.0,
+  "build_start_frame": 1,
+  "build_end_frame": 32,
+  "red_ratio": 0.015,
+  "random_seed": 20260714,
+  "preview_resolution_percentage": 50,
+  "final_resolution_percentage": 100,
+  "output_format": "PNG"
+}

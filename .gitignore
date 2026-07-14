@@ -1,8 +1,15 @@
-# Rendered output images
-/output/*.png
-/output/*.jpg
-/output/*.jpeg
-!/output/.gitkeep
+# === Blender OUTPUT World ===
+
+# 生成物（.blend / レンダー画像 / バックアップ）
+output/output_world.blend
+output/output_world.blend[0-9]*
+output/previews/
+output/render/
+output/backups/
+
+# Blender 一時ファイル
+*.blend1
+*.blend2
 
 # Python
 __pycache__/
@@ -10,6 +17,5 @@ __pycache__/
 .venv/
 venv/
 
-# Blender
-*.blend1
-*.blend2
+# OS
+.DS_Store
