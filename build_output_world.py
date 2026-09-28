@@ -143,7 +143,13 @@ FOG_MAX = 0.92
 ACCENT_HEX = "#C9C4FF"  # 粒子・縦ライン
 FOG_NODE_NAME = "OW_Fog"
 FOG_CLEAR_FRAMES = 12  # 05 の閃光 → 06 で霞が晴れるまでのフレーム数
-CHANNEL_Y_END = 14.0  # データチャネル(DIVE)を置くローカル Y の上限
+CHANNEL_Y_END = 14.0
+CHANNEL_OPEN = (136, 150)   # 通路が開くフレーム（06 の後半）
+DIVE_START_FRAME = 140      # ここからカメラが加速して通路へ
+DIVE_END_Y = 12.0           # 07 の終わりのカメラ位置（ローカル Y）
+DIVE_ALIGN_U = 0.33         # ダイブ区間のこの割合までに通路の中心へ揃える
+DIVE_DROP_U = 0.40          # 同じく通路の高さまで下がる
+AIM_TURN = (128, 158)       # 注視点を通路の奥へ振るフレーム（短いと急な振りでブレすぎる）  # データチャネル(DIVE)を置くローカル Y の上限
 # ショットごとの霞の距離（カメラ距離が違うため）: (開始m, 終了m)
 FOG_PER_SHOT = {"06": (14.0, 70.0), "07": (8.0, 48.0), "08": (26.0, 88.0), "09": (26.0, 95.0)}
 WORLD_LIGHT_STRENGTH = 0.28  # 背景は見た目1.0、照明としては弱く
@@ -820,7 +826,9 @@ def build_geometry_nodes(cfg, accent_mat=None, block_mat=None):
     idx = nodes.new("GeometryNodeInputIndex"); idx.location = (-1500, -560)
     stime = nodes.new("GeometryNodeInputSceneTime"); stime.location = (-780, -460)
     # データチャネルは DIVE ショット中だけ開く（06/08 では通路の縞が見えない）
-    ch_on_a = _M(ng, "GREATER_THAN", (-600, -760), stime.outputs["Frame"], SHOT_DIVE[0] - 0.5)
+    # 06 の後半で通路が開き（ブロックが沈み、壁がせり上がる）、07 の終わり(カット)で閉じる
+    ch_on_a = _map_range(ng, (-600, -760), stime.outputs["Frame"],
+                         CHANNEL_OPEN[0], CHANNEL_OPEN[1], 0.0, 1.0, interp="SMOOTHSTEP", clamp=True)
     ch_on_b = _M(ng, "LESS_THAN", (-600, -840), stime.outputs["Frame"], SHOT_DIVE[1] + 0.5)
     ch_on = _M(ng, "MULTIPLY", (-440, -800), ch_on_a, ch_on_b)
 
@@ -1865,29 +1873,68 @@ def create_cameras(coll, cfg, meta) -> dict:
     def W(lx, ly, z):
         return (*_rot2d(lx, ly, ang), z)
 
-    # ---- CAM_06 EMERGENCE : 32mm, 地表近くから中央の立ち上がりを見る ----
+    # ---- CAM_06→07 : 1台のカメラで連続させる（カットではなくブロックの間へ飛び込む） ----
+    #  121〜140 : 立ち上がる構造をゆっくりドリーイン（32mm, 前景ボケ）
+    #  136〜150 : 通路が開く（ブロックが沈み、両脇の壁がせり上がる / GN 側）
+    #  140〜184 : 通路の中心・高さへ揃えてから、イーズイン(3次)で加速しつつブロックの間を抜ける
+    #             レンズ 32→22mm、DOF を切り、シャッターを 0.5→1.0 に（強いモーションブラー）
+    fly_z = mh * 0.24
     tgt06 = _add_empty(coll, TARGET_06, W(0.0, 2.0, mh * 0.40))
     cam06 = _add_camera(coll, CAM_EMERGENCE, 32.0)
     _track_to(cam06, tgt06)
-    _key_loc(cam06, SHOT_EMERGENCE[0], W(4.0, -31.0, mh * 0.50))
-    _key_loc(cam06, SHOT_EMERGENCE[1], W(3.0, -27.5, mh * 0.45))  # わずかにドリーイン
-    total_smoothed += _smooth_fcurves(cam06)
     cam06.data.dof.focus_object = tgt06
-    cam06.data.dof.aperture_fstop = 1.2
 
-    # ---- CAM_07 DIVE : 22mm, 壁に挟まれたデータチャネルを低く高速に抜ける ----
-    fly_z = mh * 0.24
-    cam07 = _add_camera(coll, CAM_DIVE, 22.0)
-    tgt_dive = _add_empty(coll, TARGET_DIVE, W(cx, -16.0, fly_z * 0.85))
-    _track_to(cam07, tgt_dive)
-    for fr, ly in ((SHOT_DIVE[0], -30.0),
-                   ((SHOT_DIVE[0] + SHOT_DIVE[1]) // 2, -14.0),
-                   (SHOT_DIVE[1], 6.0)):
-        _key_loc(cam07, fr, W(cx, ly, fly_z))
-    total_smoothed += _smooth_fcurves(cam07)
-    _key_loc(tgt_dive, SHOT_DIVE[0], W(cx, -16.0, fly_z * 0.85))  # 注視点は常に前方
-    _key_loc(tgt_dive, SHOT_DIVE[1], W(cx, 24.0, fly_z * 0.80))
-    total_smoothed += _smooth_fcurves(tgt_dive)
+    f0, fa, f1 = SHOT_EMERGENCE[0], DIVE_START_FRAME, SHOT_DIVE[1]
+    # 最初から通路の軸の延長線上に置く（横移動で壁の手前を横切らない）
+    a0 = (cx, -33.5, mh * 0.55)           # 06 の開始位置
+    a1 = (cx, -31.5, mh * 0.50)           # ゆっくり寄った位置（ここから加速）
+    y_end = DIVE_END_Y
+    t06 = (0.0, 2.0, mh * 0.40)
+
+    def smooth(t):
+        t = min(max(t, 0.0), 1.0)
+        return t * t * (3.0 - 2.0 * t)
+
+    def lerp(a, b, t):
+        return a + (b - a) * t
+
+    def cam_local(f):
+        if f <= fa:
+            k = smooth((f - f0) / float(fa - f0))
+            return tuple(lerp(a1[i] * 0 + a0[i], a1[i], k) for i in range(3)), 0.0
+        u = (f - fa) / float(f1 - fa)
+        y = lerp(a1[1], y_end, u ** 3)                    # イーズイン（加速し続ける）
+        x = lerp(a1[0], cx, smooth(u / DIVE_ALIGN_U))     # フィールドに入る前に通路の中心へ
+        z = lerp(a1[2], fly_z, smooth(u / DIVE_DROP_U))   # 同じく通路の高さへ
+        return (x, y, z), u
+
+    for f in range(f0, f1 + 1):
+        (lx, ly, lz), u = cam_local(f)
+        _key_loc(cam06, f, W(lx, ly, lz))
+        # 注視点: 前半はフィールド中央、ダイブでは常にカメラの前方へ
+        ahead = (lx, ly + 14.0, lz * 0.85)
+        b = smooth((f - AIM_TURN[0]) / float(AIM_TURN[1] - AIM_TURN[0]))  # 向きはゆっくり振る
+        _key_loc(tgt06, f, W(*(lerp(t06[i], ahead[i], b) for i in range(3))))
+        cam06.data.lens = lerp(32.0, 22.0, smooth(u / 0.5))
+        cam06.data.keyframe_insert(data_path="lens", frame=f)
+        cam06.data.dof.aperture_fstop = lerp(1.2, 22.0, smooth(u / 0.2))
+        cam06.data.dof.keyframe_insert(data_path="aperture_fstop", frame=f)
+    for idblock in (cam06, tgt06, cam06.data):
+        for fc in _iter_action_fcurves(idblock):
+            for kp in fc.keyframe_points:
+                kp.interpolation = "LINEAR"  # 毎フレームのベイク値をそのまま使う
+    cam06["ow_dive_note"] = "06-07 continuous camera (baked per frame)"
+
+    # シャッター: ダイブ中はブラーを強く（アニメーション可能な版のみ）
+    scene = bpy.context.scene
+    try:
+        for f, v in ((fa, 0.5), (fa + 22, 1.0), (f1, 1.0), (f1 + 1, 0.5)):
+            scene.render.motion_blur_shutter = v
+            scene.render.keyframe_insert(data_path="motion_blur_shutter", frame=f)
+    except (TypeError, RuntimeError) as exc:
+        log.warning("シャッターのキーを打てませんでした（固定0.5）: %s", exc)
+
+    cam07 = cam06  # 07 は 06 と同じカメラ（連続）
 
     # ---- CAM_08 HERO : 40mm, 上昇しながら後退し全景へ ----
     tgt08 = _add_empty(coll, TARGET_08, W(-2.0, 8.0, mh * 0.15))
@@ -2118,7 +2165,7 @@ SHOT_TABLE = {
     "04": {"cam": CAM_PRELUDE, "range": SHOT_IGNITION, "preview_frame": 92, "label": "04_IGNITION"},
     "05": {"cam": CAM_PRELUDE, "range": SHOT_RELEASE, "preview_frame": 102, "label": "05_RELEASE"},
     "06": {"cam": CAM_EMERGENCE, "range": SHOT_EMERGENCE, "preview_frame": 144, "label": "06_EMERGENCE"},
-    "07": {"cam": CAM_DIVE, "range": SHOT_DIVE, "preview_frame": 168, "label": "07_DIVE"},
+    "07": {"cam": CAM_EMERGENCE, "range": SHOT_DIVE, "preview_frame": 168, "label": "07_DIVE"},
     "08": {"cam": CAM_HERO, "range": SHOT_HERO, "preview_frame": 216, "label": "08_HERO"},
     "09": {"cam": CAM_FINISH, "range": SHOT_FINISH, "preview_frame": 264, "label": "09_FINISH"},
 }
