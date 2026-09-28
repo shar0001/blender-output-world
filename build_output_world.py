@@ -2198,7 +2198,7 @@ def log_summary(cfg, dirs, cams, engine, instance_count) -> None:
     coll = bpy.data.collections.get(COLLECTION_NAME)
     obj_count = len(coll.objects) if coll else 0
     approx_red = int(round(instance_count * cfg["red_ratio"]))
-    log.info("================ OUTPUT_WORLD 完了サマリー (v3) ================")
+    log.info("================ OUTPUT_WORLD 完了サマリー (v4) ================")
     log.info("Blender          : %s", bpy.app.version_string)
     log.info("Collection       : %s (オブジェクト数 %d)", COLLECTION_NAME, obj_count)
     log.info("インスタンス数   : %d (%dx%d, 個別オブジェクトではない)",
@@ -2209,7 +2209,7 @@ def log_summary(cfg, dirs, cams, engine, instance_count) -> None:
     log.info("カメラ           : %s", ", ".join(sorted(c.name for c in cams.values())))
     log.info("レンダーエンジン : %s / %dx%d / %dfps", engine, RES_X, RES_Y, FPS)
     log.info("背景             : 最終=透過 / プレビュー=アイボリー")
-    log.info("尺               : %d-%d frames (96F)", FRAME_START, FRAME_END)
+    log.info("尺               : %d-%d frames (%dF / %.1f秒)", FRAME_START, FRAME_END, FRAME_END - FRAME_START + 1, (FRAME_END - FRAME_START + 1) / FPS)
     log.info(".blend 保存先    : %s", os.path.join(dirs["out"], "output_world.blend"))
     log.info("プレビュー保存先 : %s", dirs["previews"])
     log.info("V2プレビュー     : %s", dirs["v2_previews"])
