@@ -177,6 +177,47 @@ BLENDER=/Applications/Blender.app/Contents/MacOS/Blender
 
 ---
 
+## 5b. 本番書き出しと After Effects への取り込み
+
+本番（1920×1080 / 背景透過 / 24fps）は **Mac の Blender（GPU）で書き出す**のがおすすめです
+（GPU の無い環境では 1 フレーム数分かかります）。
+
+```bash
+cd （リポジトリのフォルダ）
+git pull
+BLENDER=/Applications/Blender.app/Contents/MacOS/Blender
+
+# 1) 最新のコードでシーンを作り直す（プレビューは省略）
+"$BLENDER" --background --python build_output_world.py -- --no-previews
+
+# 2) まず 1 フレームだけ試して時間を確認（目安の総時間がログに出る）
+"$BLENDER" -b output/output_world.blend -P render_final.py -- --test 200
+
+# 3) 全ショットを書き出す（一部だけなら -- 06 07 のように指定）
+"$BLENDER" -b output/output_world.blend -P render_final.py -- all
+```
+
+出力は `output/render/01_CONNECT/01_CONNECT_0001.png` 〜 `output/render/09_FINISH/09_FINISH_0264.png`。
+フレーム番号は通しの番号です（06 は 0121〜0152）。PNG は 16bit RGBA（ストレートアルファ）。
+EXR にしたい場合は `config.json` の `output_format` を `OPEN_EXR` に。
+
+**After Effects**
+
+1. After Effects で **新規プロジェクト** を作る（作品のマスター AEP では実行しない）
+2. `ファイル > スクリプト > スクリプトファイルを実行…` で `ae/import_output_world.jsx` を選ぶ
+3. フォルダ `OW_OUTPUT_WORLD` に 9 本の連番と、コンポ `OW_CLIMAX_01_09`
+   （1920×1080 / 24fps / 264F、アイボリー背景ソリッド、ショット名のマーカー付き）が作られる
+4. 保存は手動で（スクリプトは保存しない）
+
+安全のため、スクリプトは保護対象のマスター AEP
+（`/Users/shar/Documents/AE練習書き出し/イラストアニメーション_1.aep`）が開いていると何もせず終了し、
+既にアイテムがあるプロジェクトでは続行してよいか確認します。
+
+注意: 遠景の霞（アイボリー）はブロックの色に焼き込まれています。アイボリー系の背景に載せる前提です。
+暗い背景に載せる場合は、霞を透明方向へフェードさせる方式に変える必要があります。
+
+---
+
 ## 6. レンダー設定（プレビュー / 最終の2段階）
 
 | 項目 | プレビュー | 最終 |
