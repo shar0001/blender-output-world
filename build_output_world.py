@@ -89,6 +89,12 @@ CAM_HERO = PREFIX + "CAM_08_HERO"
 TARGET_06 = PREFIX + "TARGET_06"
 TARGET_DIVE = PREFIX + "TARGET_DIVE"
 TARGET_08 = PREFIX + "TARGET_08"
+CAM_PRELUDE = PREFIX + "CAM_01_05_CORE"
+CAM_FINISH = PREFIX + "CAM_09_FINISH"
+TARGET_PRELUDE = PREFIX + "TARGET_CORE"
+TARGET_FINISH = PREFIX + "TARGET_09"
+MAT_CORE_NAME = PREFIX + "Mat_Core"
+PRELUDE_CENTER = (0.0, 80.0, 40.0)  # 01〜05 はフィールドから離れた上空で撮る
 
 # フィールドをグリッド軸から少し回す（黒い溝を目立たなくする, 5〜9°）
 FIELD_ROT_Z_DEG = 7.0
@@ -99,11 +105,20 @@ HERO_ORB_COUNT = 3
 
 # タイムライン
 FRAME_START = 1
-FRAME_END = 96
+FRAME_END = 264
 FPS = 24
-SHOT_EMERGENCE = (1, 32)
-SHOT_DIVE = (33, 64)
-SHOT_HERO = (65, 96)
+# 01〜05: コア（ネットワーク→収束→静止→点火→解放）
+SHOT_CONNECT = (1, 24)
+SHOT_COLLAPSE = (25, 48)
+SHOT_SYNC = (49, 72)
+SHOT_IGNITION = (73, 96)
+SHOT_RELEASE = (97, 120)
+# 06〜08: OUTPUT フィールド
+SHOT_EMERGENCE = (121, 152)
+SHOT_DIVE = (153, 184)
+SHOT_HERO = (185, 216)
+# 09: フィニッシュ（正面・球体からデータラインが降りる）
+SHOT_FINISH = (217, 264)
 
 RES_X = 1920
 RES_Y = 1080
@@ -115,7 +130,7 @@ SIGNAL_RED_HEX = "#FF3048"
 # v3 ルック: ブロックの縦グラデーション（根元→中腹→頂部）
 BLOCK_DEEP_HEX = "#1226E6"
 BLOCK_ELECTRIC_HEX = "#3450FF"
-BLOCK_TOP_HEX = "#C2C0FF"
+BLOCK_TOP_HEX = "#AEB0FF"
 # 空気遠近（遠景をアイボリー〜ライラックに溶かす）
 BG_IVORY_HEX = "#F4EEE6"
 HAZE_HEX = "#ECE6F4"
@@ -126,10 +141,13 @@ ACCENT_HEX = "#C9C4FF"  # 粒子・縦ライン
 FOG_NODE_NAME = "OW_Fog"
 CHANNEL_Y_END = 14.0  # データチャネル(DIVE)を置くローカル Y の上限
 # ショットごとの霞の距離（カメラ距離が違うため）: (開始m, 終了m)
-FOG_PER_SHOT = {"06": (14.0, 70.0), "07": (8.0, 48.0), "08": (26.0, 88.0)}
+FOG_PER_SHOT = {"06": (14.0, 70.0), "07": (8.0, 48.0), "08": (26.0, 88.0), "09": (34.0, 105.0)}
 WORLD_LIGHT_STRENGTH = 0.28  # 背景は見た目1.0、照明としては弱く
 PARTICLE_COUNT = 380
-LOOKDEV_PREVIEW = True  # プレビューでも DOF/モーションブラーを入れて見た目を確認
+RISE_RATIO = 0.035   # 09 で小キューブ列を立てる塔の割合（中央寄り）
+RISE_STACK = 7      # 1列あたりの小キューブ数
+LOOKDEV_PREVIEW = True
+PREVIEW_SHOTS = set()  # 空=全ショット。CLI: -- --preview-shots 01,05,09  # プレビューでも DOF/モーションブラーを入れて見た目を確認
 LINE_RATIO = 0.0018
 
 
@@ -180,8 +198,8 @@ CONFIG_DEFAULTS = {
     "noise_scale": 2.2,
     "noise_strength": 1.0,
     "center_peak_strength": 1.0,
-    "build_start_frame": 1,
-    "build_end_frame": 32,
+    "build_start_frame": 121,
+    "build_end_frame": 152,
     "red_ratio": 0.015,
     "random_seed": 20260714,
     "preview_resolution_percentage": 50,
@@ -338,6 +356,7 @@ def purge_previous() -> None:
         bpy.data.cameras,
         bpy.data.lights,
         bpy.data.worlds,
+        bpy.data.curves,
     ):
         for block in list(coll_data):
             if block.name.startswith(PREFIX):
@@ -474,7 +493,7 @@ def create_block_material(cfg) -> "bpy.types.Material":
 
     h_w = m("MULTIPLY_ADD", (-1120, 60), a_h.outputs["Fac"], 0.8)
     h_w.node.inputs[2].default_value = 0.2
-    z2 = m("POWER", (-1120, 240), local_z, 2.0)
+    z2 = m("POWER", (-1120, 240), local_z, 2.8)
     g = m("MULTIPLY", (-940, 200), z2, h_w)
     top_face = nodes.new("ShaderNodeMapRange"); top_face.location = (-1120, -380)
     top_face.inputs["From Min"].default_value = 0.5
@@ -848,7 +867,9 @@ def build_geometry_nodes(cfg, accent_mat=None, block_mat=None):
     f_over = _M(ng, "ADD", (1020, -580), s1, 1.0)
 
     z_scale = _M(ng, "MULTIPLY", (1340, 40), h_b, f_over)
-    scale_vec = _combine(nt=ng, loc=(1500, 40), x=block_w, y=block_w, z=z_scale)
+    # 未成長のブロックは幅も0にして消す（数は一定のまま＝モーションブラーが破綻しない）
+    grow_w = _map_range(ng, (1340, 120), z_scale, 0.0, 0.03, 0.0, block_w, clamp=True)
+    scale_vec = _combine(nt=ng, loc=(1500, 40), x=grow_w, y=grow_w, z=z_scale)
 
     # 高さを点に保存（縦ライン用に後で読む）
     pts = _store_attr(ng, (1340, 480), m2p.outputs["Points"], "ow_z", z_scale, "POINT")
@@ -875,18 +896,24 @@ def build_geometry_nodes(cfg, accent_mat=None, block_mat=None):
     links.new(blocks, join.inputs[0])
 
     # 地面: ブロック間のすき間から背景が透けて「溝」に見えるのを防ぐ
-    ground = nodes.new("GeometryNodeMeshGrid"); ground.location = (1920, 520)
-    ground.inputs["Size X"].default_value = size_x + spacing * 2.0
-    ground.inputs["Size Y"].default_value = size_y + spacing * 2.0
-    ground.inputs["Vertices X"].default_value = 2
-    ground.inputs["Vertices Y"].default_value = 2
+    ground0 = nodes.new("GeometryNodeMeshGrid"); ground0.location = (1760, 520)
+    ground0.inputs["Size X"].default_value = size_x + spacing * 2.0
+    ground0.inputs["Size Y"].default_value = size_y + spacing * 2.0
+    ground0.inputs["Vertices X"].default_value = 2
+    ground0.inputs["Vertices Y"].default_value = 2
+    # 01〜05（フィールド生成前）は地面ごと消す
+    before = _M(ng, "LESS_THAN", (1760, 640), stime.outputs["Frame"], cfg["build_start_frame"])
+    ground = nodes.new("GeometryNodeDeleteGeometry"); ground.location = (1920, 520)
+    ground.domain = "FACE"
+    links.new(ground0.outputs["Mesh"], ground.inputs["Geometry"])
+    links.new(before, ground.inputs["Selection"])
     if block_mat is not None:
         g_m = nodes.new("GeometryNodeSetMaterial"); g_m.location = (2100, 520)
         g_m.inputs["Material"].default_value = block_mat
-        links.new(ground.outputs["Mesh"], g_m.inputs["Geometry"])
+        links.new(ground.outputs["Geometry"], g_m.inputs["Geometry"])
         links.new(g_m.outputs["Geometry"], join.inputs[0])
     else:
-        links.new(ground.outputs["Mesh"], join.inputs[0])
+        links.new(ground.outputs["Geometry"], join.inputs[0])
 
     if accent_mat is not None:
         # --- 浮遊粒子（06 の上空に漂うデータ） ---
@@ -904,7 +931,9 @@ def build_geometry_nodes(cfg, accent_mat=None, block_mat=None):
         vmax.default_value = (0.22 * hx, 0.50 * hy, mh * 1.9)
         vseed.default_value = seed + 31
         links.new(idx3.outputs["Index"], vid)
-        drift = _M(ng, "MULTIPLY", (1160, -1150), stime.outputs["Frame"], 0.02)
+        f_rel = _M(ng, "SUBTRACT", (1000, -1150), stime.outputs["Frame"], cfg["build_start_frame"])
+        f_rel = _M(ng, "MAXIMUM", (1080, -1150), f_rel, 0.0)
+        drift = _M(ng, "MULTIPLY", (1160, -1150), f_rel, 0.02)
         drift_v = _combine(nt=ng, loc=(1300, -1150), x=0.0, y=0.0, z=drift)
         vsum = nodes.new("ShaderNodeVectorMath"); vsum.operation = "ADD"
         vsum.location = (1300, -1020)
@@ -912,7 +941,8 @@ def build_geometry_nodes(cfg, accent_mat=None, block_mat=None):
         links.new(drift_v.outputs["Vector"], vsum.inputs[1])
         links.new(vsum.outputs["Vector"], cloud.inputs["Position"])
         # 粒子はビルドと一緒に現れる
-        dot_scale = _M(ng, "MULTIPLY", (1500, -1150), build_prog, 1.0)
+        pre_fin_p = _M(ng, "LESS_THAN", (1340, -1250), stime.outputs["Frame"], SHOT_FINISH[0] - 0.5)
+        dot_scale = _M(ng, "MULTIPLY", (1500, -1150), build_prog, pre_fin_p)  # 09 では出さない
 
         ico = nodes.new("GeometryNodeMeshIcoSphere"); ico.location = (1500, -860)
         ico.inputs["Radius"].default_value = 0.045
@@ -966,7 +996,9 @@ def build_geometry_nodes(cfg, accent_mat=None, block_mat=None):
         l_scale = _combine(nt=ng, loc=(2140, -1500), x=1.0, y=1.0, z=line_len)
         iop_l = nodes.new("GeometryNodeInstanceOnPoints"); iop_l.location = (2140, -1300)
         links.new(sub, iop_l.inputs["Points"])
-        line_vis = _M(ng, "GREATER_THAN", (1980, -1400), line_prog, 0.02)
+        pre_fin = _M(ng, "LESS_THAN", (1980, -1480), stime.outputs["Frame"], SHOT_FINISH[0] - 0.5)
+        # 伸びる前のラインはブロック内に隠れているので選別不要。数の変化はカットの瞬間(09)だけ
+        line_vis = pre_fin  # 09 では出さない
         links.new(line_vis, iop_l.inputs["Selection"])
         links.new(cyl_m.outputs["Geometry"], iop_l.inputs["Instance"])
         links.new(l_scale.outputs["Vector"], iop_l.inputs["Scale"])
@@ -987,6 +1019,52 @@ def build_geometry_nodes(cfg, accent_mat=None, block_mat=None):
         links.new(line_vis, iop_d.inputs["Selection"])
         links.new(ico2_m.outputs["Geometry"], iop_d.inputs["Instance"])
         links.new(iop_d.outputs["Instances"], join.inputs[0])
+
+    # --- 09 FINISH: 塔の上に小キューブの列が立ち昇る（データの上昇） ---
+    fin_prog = _map_range(ng, (1000, -2100), stime.outputs["Frame"],
+                          SHOT_FINISH[0], SHOT_FINISH[0] + 24, 0.0, 1.0,
+                          interp="SMOOTHSTEP", clamp=True)
+    idx6 = nodes.new("GeometryNodeInputIndex"); idx6.location = (1000, -2250)
+    rnd_c = _random_float(ng, (1160, -2250), seed + 53, idx6.outputs["Index"])
+    is_col0 = _M(ng, "LESS_THAN", (1320, -2250), rnd_c, RISE_RATIO)
+    in_band = _map_range(ng, (1160, -2380), dist_center, 0.0, 0.55 * max_radius,
+                         1.0, 0.0, interp="LINEAR", clamp=True)
+    is_col1 = _M(ng, "MULTIPLY", (1320, -2380), is_col0, _M(ng, "GREATER_THAN", (1240, -2440), in_band, 0.05))
+    on_fin = _M(ng, "GREATER_THAN", (1320, -2500), stime.outputs["Frame"], SHOT_FINISH[0] - 0.5)
+    is_col = _M(ng, "MULTIPLY", (1480, -2320), is_col1, on_fin)
+    colsel = nodes.new("GeometryNodeSeparateGeometry"); colsel.location = (1640, -2200)
+    colsel.domain = "POINT"
+    links.new(pts, colsel.inputs["Geometry"])
+    links.new(is_col, colsel.inputs["Selection"])
+    dup = nodes.new("GeometryNodeDuplicateElements"); dup.location = (1800, -2200)
+    dup.domain = "POINT"
+    dup.inputs["Amount"].default_value = RISE_STACK
+    links.new(colsel.outputs["Selection"], dup.inputs["Geometry"])
+    named2 = nodes.new("GeometryNodeInputNamedAttribute"); named2.location = (1640, -2400)
+    named2.data_type = "FLOAT"
+    named2.inputs["Name"].default_value = "ow_z"
+    z_top = next(o for o in named2.outputs if o.name == "Attribute")
+    k1 = _M(ng, "ADD", (1960, -2400), dup.outputs["Duplicate Index"], 1.0)
+    idx7 = nodes.new("GeometryNodeInputIndex"); idx7.location = (1800, -2520)
+    gap = _random_float(ng, (1960, -2520), seed + 59, idx7.outputs["Index"], 0.22, 0.55)
+    stack = _M(ng, "MULTIPLY", (2120, -2400), k1, gap)
+    rise = _M(ng, "MULTIPLY", (2120, -2520), fin_prog, mh * 0.35)
+    rise_k = _M(ng, "MULTIPLY", (2280, -2460), rise, _M(ng, "DIVIDE", (2200, -2560), k1, float(RISE_STACK)))
+    zc = _M(ng, "ADD", (2280, -2360), z_top, stack)
+    zc = _M(ng, "ADD", (2440, -2360), zc, rise_k)
+    zc_v = _combine(nt=ng, loc=(2600, -2360), x=0.0, y=0.0, z=zc)
+    cpos = nodes.new("GeometryNodeSetPosition"); cpos.location = (2600, -2200)
+    links.new(dup.outputs["Geometry"], cpos.inputs["Geometry"])
+    links.new(zc_v.outputs["Vector"], cpos.inputs["Offset"])
+    csz = _random_float(ng, (2440, -2560), seed + 61, idx7.outputs["Index"], 0.05, 0.13)
+    shrink = _M(ng, "SUBTRACT", (2440, -2660), 1.15, _M(ng, "DIVIDE", (2280, -2660), k1, float(RISE_STACK) + 1.0))
+    csz = _M(ng, "MULTIPLY", (2600, -2560), csz, shrink)   # 上ほど小さく
+    csz = _M(ng, "MULTIPLY", (2760, -2560), csz, fin_prog)
+    iop_c = nodes.new("GeometryNodeInstanceOnPoints"); iop_c.location = (2760, -2200)
+    links.new(cpos.outputs["Geometry"], iop_c.inputs["Points"])
+    links.new(obj_info.outputs["Geometry"], iop_c.inputs["Instance"])
+    links.new(csz, iop_c.inputs["Scale"])
+    links.new(iop_c.outputs["Instances"], join.inputs[0])
 
     links.new(join.outputs["Geometry"], n_out.inputs[0])
 
@@ -1102,6 +1180,379 @@ def create_data_lines(coll, cfg, meta, main_orb) -> list:
         link_to_world(coll, obj)
         made.append(obj)
     return made
+
+
+# --------------------------------------------------------------------------- #
+# 01〜05: コア（ネットワーク → 収束 → 静止 → 点火 → 解放）                       #
+# --------------------------------------------------------------------------- #
+def _emission_material(name, hex_color, strength):
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    for n in list(nt.nodes):
+        nt.nodes.remove(n)
+    out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (200, 0)
+    emis = nt.nodes.new("ShaderNodeEmission"); emis.location = (0, 0)
+    emis.inputs["Color"].default_value = hex_to_linear_rgba(hex_color)
+    emis.inputs["Strength"].default_value = strength
+    nt.links.new(emis.outputs["Emission"], out.inputs["Surface"])
+    return mat
+
+
+def _key_visible(obj, first, last):
+    """first〜last の間だけレンダー/ビューポートに出す（CONSTANT キー）。"""
+    for attr in ("hide_render", "hide_viewport"):
+        if first > FRAME_START:
+            setattr(obj, attr, True)
+            obj.keyframe_insert(data_path=attr, frame=FRAME_START)
+        setattr(obj, attr, False)
+        obj.keyframe_insert(data_path=attr, frame=first)
+        if last < FRAME_END:
+            setattr(obj, attr, True)
+            obj.keyframe_insert(data_path=attr, frame=last + 1)
+    for fc in _iter_action_fcurves(obj):
+        if fc.data_path.startswith("hide_"):
+            for kp in fc.keyframe_points:
+                kp.interpolation = "CONSTANT"
+    setattr(obj, "hide_render", False)
+    setattr(obj, "hide_viewport", False)
+
+
+def _key_mod(obj, mod, ident, frame, value):
+    mod[ident] = float(value)
+    obj.keyframe_insert(data_path=f'modifiers["{mod.name}"]["{ident}"]', frame=frame)
+
+
+def _build_radial_gn(name, line_mat, dot_mat=None):
+    """位置を中心から Scale 倍し、辺を細いチューブ、頂点をドットにする GN。
+
+    戻り値: (node_group, {"Scale": id, "DotScale": id, "LineRadius": id})
+    """
+    ng = bpy.data.node_groups.new(name, "GeometryNodeTree")
+    new_interface_socket(ng, "Geometry", "INPUT", "NodeSocketGeometry")
+    ids = {}
+    for sock_name, default in (("Scale", 1.0), ("DotScale", 1.0), ("LineRadius", 0.006)):
+        item = new_interface_socket(ng, sock_name, "INPUT", "NodeSocketFloat")
+        if hasattr(item, "default_value"):
+            item.default_value = default
+        ids[sock_name] = item.identifier
+    new_interface_socket(ng, "Geometry", "OUTPUT", "NodeSocketGeometry")
+    nodes, links = ng.nodes, ng.links
+    n_in = nodes.new("NodeGroupInput"); n_in.location = (-900, 0)
+    n_out = nodes.new("NodeGroupOutput"); n_out.location = (900, 0)
+
+    pos = nodes.new("GeometryNodeInputPosition"); pos.location = (-700, -200)
+    scl = nodes.new("ShaderNodeVectorMath"); scl.operation = "SCALE"; scl.location = (-520, -200)
+    links.new(pos.outputs["Position"], scl.inputs[0])
+    links.new(n_in.outputs["Scale"], scl.inputs["Scale"])
+    setp = nodes.new("GeometryNodeSetPosition"); setp.location = (-340, 0)
+    links.new(n_in.outputs["Geometry"], setp.inputs["Geometry"])
+    links.new(scl.outputs["Vector"], setp.inputs["Position"])
+
+    join = nodes.new("GeometryNodeJoinGeometry"); join.location = (700, 0)
+
+    # 辺 → 細いチューブ
+    m2c = nodes.new("GeometryNodeMeshToCurve"); m2c.location = (-120, 120)
+    links.new(setp.outputs["Geometry"], m2c.inputs["Mesh"])
+    circ = nodes.new("GeometryNodeCurvePrimitiveCircle"); circ.location = (-120, 280)
+    circ.inputs["Resolution"].default_value = 4
+    links.new(n_in.outputs["LineRadius"], circ.inputs["Radius"])
+    c2m = nodes.new("GeometryNodeCurveToMesh"); c2m.location = (100, 160)
+    links.new(m2c.outputs["Curve"], c2m.inputs["Curve"])
+    links.new(circ.outputs["Curve"], c2m.inputs["Profile Curve"])
+    lm = nodes.new("GeometryNodeSetMaterial"); lm.location = (300, 160)
+    lm.inputs["Material"].default_value = line_mat
+    links.new(c2m.outputs["Mesh"], lm.inputs["Geometry"])
+    links.new(lm.outputs["Geometry"], join.inputs[0])
+
+    if dot_mat is not None:
+        m2p = nodes.new("GeometryNodeMeshToPoints"); m2p.location = (-120, -160)
+        links.new(setp.outputs["Geometry"], m2p.inputs["Mesh"])
+        ico = nodes.new("GeometryNodeMeshIcoSphere"); ico.location = (-120, -340)
+        ico.inputs["Radius"].default_value = 0.026
+        ico.inputs["Subdivisions"].default_value = 2
+        dm = nodes.new("GeometryNodeSetMaterial"); dm.location = (60, -340)
+        dm.inputs["Material"].default_value = dot_mat
+        links.new(ico.outputs["Mesh"], dm.inputs["Geometry"])
+        idx = nodes.new("GeometryNodeInputIndex"); idx.location = (-120, -500)
+        rnd = _random_float(ng, (60, -500), 7, idx.outputs["Index"], 0.5, 1.6)
+        hub_r = _random_float(ng, (60, -620), 13, idx.outputs["Index"])
+        is_hub = _M(ng, "LESS_THAN", (220, -620), hub_r, 0.07)
+        hub_mul = _M(ng, "MULTIPLY_ADD", (380, -620), is_hub, 2.2)
+        hub_mul.node.inputs[2].default_value = 1.0
+        sz = _M(ng, "MULTIPLY", (380, -500), rnd, hub_mul)
+        sz = _M(ng, "MULTIPLY", (540, -500), sz, n_in.outputs["DotScale"])
+        iop = nodes.new("GeometryNodeInstanceOnPoints"); iop.location = (540, -200)
+        links.new(m2p.outputs["Points"], iop.inputs["Points"])
+        links.new(dm.outputs["Geometry"], iop.inputs["Instance"])
+        links.new(sz, iop.inputs["Scale"])
+        links.new(iop.outputs["Instances"], join.inputs[0])
+
+    links.new(join.outputs["Geometry"], n_out.inputs[0])
+    return ng, ids
+
+
+def _network_mesh(name, seed, count, radius):
+    """球状に分布した点と、近傍を結ぶ辺のメッシュ（ネットワーク）。"""
+    import random
+    rng = random.Random(seed)
+    pts = []
+    for _ in range(count):
+        v = Vector((rng.gauss(0, 1), rng.gauss(0, 1), rng.gauss(0, 1)))
+        if v.length < 1e-6:
+            continue
+        v.normalize()
+        pts.append(v * radius * (rng.random() ** 0.45))
+    edges = set()
+    link_d = radius * 0.36
+    for i, a in enumerate(pts):
+        near = sorted(((b - a).length, j) for j, b in enumerate(pts) if j != i)
+        for d, j in near[:rng.choice((1, 2, 2, 3))]:
+            if d < link_d:
+                edges.add((min(i, j), max(i, j)))
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata([tuple(p) for p in pts], sorted(edges), [])
+    mesh.update()
+    return mesh, len(pts), len(edges)
+
+
+def _streak_mesh(name, seed, count, r_min, r_max):
+    """中心から放射方向の短い線分（収束/爆発の光線）。"""
+    import random
+    rng = random.Random(seed)
+    verts, edges = [], []
+    for _ in range(count):
+        v = Vector((rng.gauss(0, 1), rng.gauss(0, 1), rng.gauss(0, 1)))
+        if v.length < 1e-6:
+            continue
+        v.normalize()
+        r0 = rng.uniform(r_min, r_max)
+        ln = rng.uniform(0.25, 2.4)
+        verts += [tuple(v * r0), tuple(v * (r0 + ln))]
+        edges.append((len(verts) - 2, len(verts) - 1))
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(verts, edges, [])
+    mesh.update()
+    return mesh
+
+
+def create_core_material() -> "bpy.types.Material":
+    """コア球: ライラックの光沢 + 発光（キー） + 点火時の光のひび（Voronoi, キー）。"""
+    mat = bpy.data.materials.new(MAT_CORE_NAME)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nodes, links = nt.nodes, nt.links
+    bsdf = _principled(mat)
+    out = nodes.get("Material Output")
+    bsdf.inputs["Base Color"].default_value = hex_to_linear_rgba("#DCD9FF")
+    bsdf.inputs["Roughness"].default_value = 0.28
+    if "Coat Weight" in bsdf.inputs:
+        bsdf.inputs["Coat Weight"].default_value = 0.5
+    for ename in ("Emission Color", "Emission"):
+        if ename in bsdf.inputs:
+            bsdf.inputs[ename].default_value = hex_to_linear_rgba("#C9C4FF")
+            break
+    bsdf.inputs["Emission Strength"].default_value = 0.5
+
+    tex = nodes.new("ShaderNodeTexCoord"); tex.location = (-900, -300)
+    vor = nodes.new("ShaderNodeTexVoronoi"); vor.location = (-700, -300)
+    vor.voronoi_dimensions = "4D"
+    vor.feature = "DISTANCE_TO_EDGE"
+    vor.inputs["Scale"].default_value = 2.2
+    vor.name = "OW_CoreVeins"
+    links.new(tex.outputs["Object"], vor.inputs["Vector"])
+    edge = nodes.new("ShaderNodeMapRange"); edge.location = (-500, -300)
+    edge.inputs["From Min"].default_value = 0.0
+    edge.inputs["From Max"].default_value = 0.035
+    edge.inputs["To Min"].default_value = 1.0
+    edge.inputs["To Max"].default_value = 0.0
+    links.new(vor.outputs["Distance"], edge.inputs["Value"])
+    amt = nodes.new("ShaderNodeValue"); amt.location = (-500, -480)
+    amt.name = "OW_VeinAmount"
+    amt.outputs[0].default_value = 0.0
+    vein = nodes.new("ShaderNodeMath"); vein.operation = "MULTIPLY"; vein.location = (-300, -360)
+    links.new(edge.outputs["Result"], vein.inputs[0])
+    links.new(amt.outputs[0], vein.inputs[1])
+    vem = nodes.new("ShaderNodeEmission"); vem.location = (-100, -360)
+    vem.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+    links.new(vein.outputs["Value"], vem.inputs["Strength"])
+    add = nodes.new("ShaderNodeAddShader"); add.location = (200, 0)
+    links.new(bsdf.outputs["BSDF"], add.inputs[0])
+    links.new(vem.outputs["Emission"], add.inputs[1])
+    links.new(add.outputs["Shader"], out.inputs["Surface"])
+    return mat
+
+
+def create_prelude(coll, cfg) -> dict:
+    """01〜05 を作る。カメラ1台 + ネットワーク/光線/コアの3オブジェクト。"""
+    seed = cfg["random_seed"]
+    c = Vector(PRELUDE_CENTER)
+    dot_mat = _emission_material(PREFIX + "Mat_NetDot", "#4450EE", 1.0)
+    line_mat = _emission_material(PREFIX + "Mat_NetLine", "#B4B0EE", 1.0)
+    streak_mat = _emission_material(PREFIX + "Mat_Streak", "#D8D3F8", 1.4)
+
+    # ネットワーク（01 収縮 → 02 収束 → 05 爆発で外へ）
+    net_mesh, n_pts, n_edges = _network_mesh(PREFIX + "NetworkMesh", seed + 71, 720, 3.8)
+    net = bpy.data.objects.new(PREFIX + "Network", net_mesh)
+    net.location = c
+    link_to_world(coll, net)
+    ng_net, nid = _build_radial_gn(PREFIX + "GN_Network", line_mat, dot_mat)
+    mn = net.modifiers.new(name="OW_Radial", type="NODES"); mn.node_group = ng_net
+    for f, s_, d_, l_ in ((1, 1.0, 1.0, 0.006), (24, 0.80, 1.0, 0.006), (30, 0.70, 1.0, 0.005),
+                          (46, 0.05, 0.25, 0.0012), (48, 0.03, 0.0, 0.0),
+                          (97, 0.03, 0.0, 0.0), (99, 0.2, 0.9, 0.0), (116, 6.5, 0.7, 0.0),
+                          (120, 7.5, 0.0, 0.0)):
+        _key_mod(net, mn, nid["Scale"], f, s_)
+        _key_mod(net, mn, nid["DotScale"], f, d_)
+        _key_mod(net, mn, nid["LineRadius"], f, l_)
+    _smooth_fcurves(net)
+    _key_visible(net, SHOT_CONNECT[0], SHOT_RELEASE[1])
+
+    # 光線（02 で中心へ流れ込み / 05 で外へ爆発）
+    st = bpy.data.objects.new(PREFIX + "Streaks", _streak_mesh(PREFIX + "StreakMesh", seed + 73, 460, 1.3, 5.5))
+    st.location = c
+    link_to_world(coll, st)
+    ng_st, sid = _build_radial_gn(PREFIX + "GN_Streaks", streak_mat, None)
+    ms = st.modifiers.new(name="OW_Radial", type="NODES"); ms.node_group = ng_st
+    for f, s_, l_ in ((1, 1.9, 0.0), (24, 1.9, 0.0), (27, 1.7, 0.006), (46, 0.15, 0.004),
+                      (49, 0.1, 0.0), (96, 0.2, 0.0), (98, 0.35, 0.011), (114, 7.0, 0.011),
+                      (120, 8.0, 0.0)):
+        _key_mod(st, ms, sid["Scale"], f, s_)
+        _key_mod(st, ms, sid["LineRadius"], f, l_)
+    _smooth_fcurves(st)
+    _key_visible(st, SHOT_CONNECT[0], SHOT_RELEASE[1])
+
+    # コア球（03 静止 / 04 点火 / 05 閃光で画面を白に）
+    core_mat = create_core_material()
+    core_mesh = _make_icosphere(PREFIX + "CoreMesh", 1.0, 5)
+    core_mesh.materials.append(core_mat)
+    core = bpy.data.objects.new(PREFIX + "Core", core_mesh)
+    core.location = c
+    link_to_world(coll, core)
+    import random
+    rng = random.Random(seed + 79)
+    scale_keys = [(1, 0.32), (24, 0.30), (34, 0.34), (48, 1.0), (60, 1.025), (72, 1.0)]
+    for f in range(75, 96, 3):  # 点火: 不安定に震える
+        scale_keys.append((f, rng.uniform(0.98, 1.08)))
+    scale_keys += [(97, 1.02), (101, 0.55), (107, 3.0), (112, 16.0), (116, 60.0)]
+    for f, s_ in scale_keys:
+        core.scale = (s_, s_, s_)
+        core.keyframe_insert(data_path="scale", frame=f)
+    _smooth_fcurves(core)
+    _key_visible(core, SHOT_CONNECT[0], SHOT_RELEASE[1])
+    bsdf = _principled(core_mat)
+    es = bsdf.inputs["Emission Strength"]
+    for f, v in ((1, 0.35), (48, 0.55), (72, 0.6), (88, 0.7), (96, 1.0), (100, 4.0), (106, 18.0),
+                 (111, 60.0)):
+        es.default_value = v
+        es.keyframe_insert("default_value", frame=f)
+    amt = core_mat.node_tree.nodes["OW_VeinAmount"].outputs[0]
+    for f, v in ((1, 0.0), (72, 0.0), (80, 3.0), (94, 7.0), (99, 0.0)):
+        amt.default_value = v
+        amt.keyframe_insert("default_value", frame=f)
+    w = core_mat.node_tree.nodes["OW_CoreVeins"].inputs["W"]
+    for f, v in ((1, 0.0), (73, 0.0), (100, 2.5)):
+        w.default_value = v
+        w.keyframe_insert("default_value", frame=f)
+    _smooth_fcurves(core_mat.node_tree)
+
+    # カメラ（01〜05 共通, 50mm, ゆっくり寄る）
+    tgt = _add_empty(coll, TARGET_PRELUDE, tuple(c))
+    # コア球に立体感を出すやわらかいキーライト（01〜05 のみ）
+    kd = bpy.data.lights.new(PREFIX + "CoreKey", "AREA")
+    kd.shape = "DISK"
+    kd.size = 7.0
+    kd.energy = 900.0
+    kd.color = (0.93, 0.92, 1.0)
+    kl = bpy.data.objects.new(PREFIX + "CoreKey", kd)
+    kl.location = tuple(c + Vector((-6.0, -9.0, 7.0)))
+    link_to_world(coll, kl)
+    _track_to(kl, tgt)
+    _key_visible(kl, SHOT_CONNECT[0], SHOT_RELEASE[1])
+    cam = _add_camera(coll, CAM_PRELUDE, 50.0)
+    _track_to(cam, tgt)
+    _key_loc(cam, SHOT_CONNECT[0], tuple(c + Vector((0.6, -19.0, 0.8))))
+    _key_loc(cam, SHOT_IGNITION[1], tuple(c + Vector((0.0, -15.5, 0.3))))
+    _key_loc(cam, SHOT_RELEASE[1], tuple(c + Vector((0.0, -14.5, 0.2))))
+    _smooth_fcurves(cam)
+
+    log.info("01-05 コア: ネットワーク点=%d 辺=%d / 光線=460 / コア球(点火・閃光キー) / カメラ=%s",
+             n_pts, n_edges, CAM_PRELUDE)
+    return {"camera": cam, "objects": [net, st, core]}
+
+
+# --------------------------------------------------------------------------- #
+# 09: フィニッシュ（正面・球体からデータラインが扇状に降りる）                      #
+# --------------------------------------------------------------------------- #
+def create_finish(coll, cfg, meta) -> dict:
+    ang = meta["field_rot"]
+    mh = cfg["max_height"]
+
+    def W(lx, ly, z):
+        return Vector((*_rot2d(lx, ly, ang), z))
+
+    orb_mat = bpy.data.materials.get(MAT_ORB_NAME) or create_orb_material(MAT_ORB_NAME, 2.2)
+    orb_pos = W(0.0, 6.0, mh * 2.95)
+    orb_mesh = _make_icosphere(PREFIX + "FinishOrbMesh", 0.85, 4)
+    orb_mesh.materials.append(orb_mat)
+    orb = bpy.data.objects.new(PREFIX + "FinishOrb", orb_mesh)
+    orb.location = orb_pos
+    link_to_world(coll, orb)
+    _key_visible(orb, SHOT_FINISH[0], SHOT_FINISH[1])
+
+    # データライン（1つのカーブに多数のスプライン）
+    import random
+    rng = random.Random(cfg["random_seed"] + 83)
+    cu = bpy.data.curves.new(PREFIX + "DataFanCurve", "CURVE")
+    cu.dimensions = "3D"
+    cu.bevel_depth = 0.0065
+    cu.bevel_resolution = 0
+    cu.bevel_factor_mapping_end = "SPLINE"
+    p0 = orb_pos - Vector((0.0, 0.0, 0.75))
+    n_lines = 56
+    for i in range(n_lines):
+        t = i / (n_lines - 1)
+        lx = (t - 0.5) * 36.0 + rng.uniform(-0.6, 0.6)
+        ly = rng.uniform(1.0, 13.0)
+        lz = rng.uniform(1.6, 4.2)
+        p2 = W(lx, ly, lz)
+        ctrl = Vector((p0.x + (p2.x - p0.x) * 0.72,
+                       p0.y + (p2.y - p0.y) * 0.72,
+                       p0.z - (p0.z - p2.z) * 0.22))
+        sp = cu.splines.new("POLY")
+        n = 28
+        sp.points.add(n - 1)
+        for k in range(n):
+            u = k / (n - 1)
+            q = (1 - u) ** 2 * p0 + 2 * (1 - u) * u * ctrl + u ** 2 * p2
+            sp.points[k].co = (q.x, q.y, q.z, 1.0)
+    sp = cu.splines.new("POLY")  # 真下への1本
+    sp.points.add(1)
+    down = W(0.0, 6.0, mh * 0.6)
+    sp.points[0].co = (p0.x, p0.y, p0.z, 1.0)
+    sp.points[1].co = (down.x, down.y, down.z, 1.0)
+    cu.materials.append(_emission_material(PREFIX + "Mat_FanLine", "#B9B3F4", 1.15))
+    fan = bpy.data.objects.new(PREFIX + "DataFan", cu)
+    link_to_world(coll, fan)
+    for f, v in ((SHOT_FINISH[0], 0.0), (SHOT_FINISH[0] + 26, 1.0)):
+        cu.bevel_factor_end = v
+        cu.keyframe_insert(data_path="bevel_factor_end", frame=f)
+    _smooth_fcurves(cu)
+    _key_visible(fan, SHOT_FINISH[0], SHOT_FINISH[1])
+
+    # カメラ（正面・やや低め・前景ボケ）
+    tgt = _add_empty(coll, TARGET_FINISH, tuple(W(0.0, 2.0, mh * 1.25)))
+    cam = _add_camera(coll, CAM_FINISH, 42.0)
+    _track_to(cam, tgt)
+    _key_loc(cam, SHOT_FINISH[0], tuple(W(0.0, -36.0, mh * 1.05)))
+    _key_loc(cam, SHOT_FINISH[1], tuple(W(0.0, -33.5, mh * 1.0)))
+    _smooth_fcurves(cam)
+    cam.data.dof.focus_object = tgt
+    cam.data.dof.aperture_fstop = 1.8
+
+    log.info("09 フィニッシュ: 球体 + データライン %d 本 + 小キューブ上昇 / カメラ=%s",
+             n_lines + 1, CAM_FINISH)
+    return {"camera": cam, "objects": [orb, fan]}
 
 
 # --------------------------------------------------------------------------- #
@@ -1284,7 +1735,8 @@ def key_fog_per_shot(block_mat) -> None:
     if fog is None:
         log.warning("霞ノードが見つからないためショット別の霞をスキップします。")
         return
-    for key, (start, _end) in (("06", SHOT_EMERGENCE), ("07", SHOT_DIVE), ("08", SHOT_HERO)):
+    for key, (start, _end) in (("06", SHOT_EMERGENCE), ("07", SHOT_DIVE), ("08", SHOT_HERO),
+                               ("09", SHOT_FINISH)):
         f0, f1 = FOG_PER_SHOT[key]
         fog.inputs["From Min"].default_value = f0
         fog.inputs["From Max"].default_value = f1
@@ -1301,9 +1753,11 @@ def key_fog_per_shot(block_mat) -> None:
 def setup_markers(cams: dict) -> None:
     scene = bpy.context.scene
     plan = [
+        (PREFIX + "M_01", SHOT_CONNECT[0], cams["prelude"]),
         (PREFIX + "M_06", SHOT_EMERGENCE[0], cams["emergence"]),
         (PREFIX + "M_07", SHOT_DIVE[0], cams["dive"]),
         (PREFIX + "M_08", SHOT_HERO[0], cams["hero"]),
+        (PREFIX + "M_09", SHOT_FINISH[0], cams["finish"]),
     ]
     for name, frame, cam in plan:
         mk = scene.timeline_markers.new(name, frame=frame)
@@ -1396,7 +1850,7 @@ def apply_preview_settings(cfg) -> None:
     _set_motion_blur(scene, LOOKDEV_PREVIEW)
     _set_dof_all(False)
     if LOOKDEV_PREVIEW:  # 見た目確認用: 被写界深度も最終と同じにする
-        for name in (CAM_EMERGENCE, CAM_HERO):
+        for name in (CAM_EMERGENCE, CAM_HERO, CAM_FINISH):
             cam = bpy.data.objects.get(name)
             if cam is not None:
                 cam.data.dof.use_dof = True
@@ -1410,7 +1864,7 @@ def apply_final_settings(cfg) -> None:
         ee.taa_render_samples = 128
     _set_motion_blur(scene, True)
     _set_dof_all(False)
-    for name in (CAM_EMERGENCE, CAM_HERO):
+    for name in (CAM_EMERGENCE, CAM_HERO, CAM_FINISH):
         cam = bpy.data.objects.get(name)
         if cam is not None:
             cam.data.dof.use_dof = True
@@ -1427,7 +1881,7 @@ def _set_motion_blur(scene, on: bool) -> None:
 
 
 def _set_dof_all(on: bool) -> None:
-    for name in (CAM_EMERGENCE, CAM_DIVE, CAM_HERO):
+    for name in (CAM_PRELUDE, CAM_EMERGENCE, CAM_DIVE, CAM_HERO, CAM_FINISH):
         cam = bpy.data.objects.get(name)
         if cam is not None:
             cam.data.dof.use_dof = on
@@ -1473,9 +1927,15 @@ def _restore_bg(snap):
 # プレビュー / ショットレンダー                                                  #
 # --------------------------------------------------------------------------- #
 SHOT_TABLE = {
-    "06": {"cam": CAM_EMERGENCE, "range": SHOT_EMERGENCE, "preview_frame": 24},
-    "07": {"cam": CAM_DIVE, "range": SHOT_DIVE, "preview_frame": 48},
-    "08": {"cam": CAM_HERO, "range": SHOT_HERO, "preview_frame": 96},
+    "01": {"cam": CAM_PRELUDE, "range": SHOT_CONNECT, "preview_frame": 14, "label": "01_CONNECT"},
+    "02": {"cam": CAM_PRELUDE, "range": SHOT_COLLAPSE, "preview_frame": 38, "label": "02_COLLAPSE"},
+    "03": {"cam": CAM_PRELUDE, "range": SHOT_SYNC, "preview_frame": 62, "label": "03_SYNC"},
+    "04": {"cam": CAM_PRELUDE, "range": SHOT_IGNITION, "preview_frame": 92, "label": "04_IGNITION"},
+    "05": {"cam": CAM_PRELUDE, "range": SHOT_RELEASE, "preview_frame": 102, "label": "05_RELEASE"},
+    "06": {"cam": CAM_EMERGENCE, "range": SHOT_EMERGENCE, "preview_frame": 144, "label": "06_EMERGENCE"},
+    "07": {"cam": CAM_DIVE, "range": SHOT_DIVE, "preview_frame": 168, "label": "07_DIVE"},
+    "08": {"cam": CAM_HERO, "range": SHOT_HERO, "preview_frame": 216, "label": "08_HERO"},
+    "09": {"cam": CAM_FINISH, "range": SHOT_FINISH, "preview_frame": 264, "label": "09_FINISH"},
 }
 
 
@@ -1497,16 +1957,18 @@ def _render_preview_set(cfg, out_dir, label) -> list:
     saved = []
     try:
         for key, info in SHOT_TABLE.items():
+            if PREVIEW_SHOTS and key not in PREVIEW_SHOTS:
+                continue
             cam = bpy.data.objects.get(info["cam"])
             if cam is None:
                 log.warning("プレビュー(%s): カメラが見つかりません %s", label, info["cam"])
                 continue
             scene.camera = cam
             scene.frame_set(info["preview_frame"])
-            out_path = os.path.join(out_dir, f"{info['cam']}.png")
+            out_path = os.path.join(out_dir, f"{info['label']}.png")
             scene.render.filepath = out_path
-            log.info("[%s] 描画: cam=%s frame=%d 背景=アイボリー 材質=%s",
-                     label, info["cam"], info["preview_frame"], mat_state)
+            log.info("[%s] 描画: shot=%s cam=%s frame=%d 背景=アイボリー 材質=%s",
+                     label, key, info["cam"], info["preview_frame"], mat_state)
             try:
                 bpy.ops.render.render(write_still=True)
                 saved.append(out_path)
@@ -1528,7 +1990,7 @@ def render_v2_previews(cfg, dirs: dict) -> list:
 def render_shot(shot_key: str, cfg, dirs: dict) -> str:
     """指定ショット('06'/'07'/'08')を連番でレンダリング（最終・透過）。"""
     if shot_key not in SHOT_TABLE:
-        raise ValueError(f"未知のショット: {shot_key} (06/07/08)")
+        raise ValueError(f"未知のショット: {shot_key} (01〜09)")
     info = SHOT_TABLE[shot_key]
     scene = bpy.context.scene
     apply_final_settings(cfg)
@@ -1536,9 +1998,9 @@ def render_shot(shot_key: str, cfg, dirs: dict) -> str:
     cam = bpy.data.objects.get(info["cam"])
     scene.camera = cam
     scene.frame_start, scene.frame_end = info["range"]
-    shot_dir = os.path.join(dirs["render"], info["cam"])
+    shot_dir = os.path.join(dirs["render"], info["label"])
     os.makedirs(shot_dir, exist_ok=True)
-    scene.render.filepath = os.path.join(shot_dir, info["cam"] + "_")
+    scene.render.filepath = os.path.join(shot_dir, info["label"] + "_")
     log.info("最終描画(連番/透過): %s frames %s -> %s", info["cam"], info["range"], shot_dir)
     bpy.ops.render.render(animation=True)
     return shot_dir
@@ -1585,7 +2047,7 @@ def build(do_previews: bool = True, v2: bool = True) -> None:
     base_out = os.path.join(script_dir(), "output")
     dirs = ensure_dirs(base_out)
 
-    log.info("Blender %s / OUTPUT_WORLD 構築(v3)を開始します。", bpy.app.version_string)
+    log.info("Blender %s / OUTPUT_WORLD 構築(v4: 01〜09)を開始します。", bpy.app.version_string)
 
     backup_existing_blend(dirs)
     purge_previous()
@@ -1597,15 +2059,18 @@ def build(do_previews: bool = True, v2: bool = True) -> None:
     accent_mat = create_accent_material()
     field, meta = create_field_object(coll, cfg, accent_mat, block_mat)  # GN でインスタンス化
     orbs = create_hero_orbs(coll, cfg, meta)
-    if orbs:
-        create_data_lines(coll, cfg, meta, orbs[0])
+    lines = create_data_lines(coll, cfg, meta, orbs[0]) if orbs else []
+    for o in orbs + lines:  # 06〜08 の球体は 01〜05 と 09 では出さない
+        _key_visible(o, SHOT_EMERGENCE[0], SHOT_HERO[1])
     create_lights(coll, cfg)
     cams = create_cameras(coll, cfg, meta)
+    cams["prelude"] = create_prelude(coll, cfg)["camera"]
+    cams["finish"] = create_finish(coll, cfg, meta)["camera"]
     setup_markers(cams)
     key_fog_per_shot(block_mat)
 
     engine = setup_scene_base(cfg)
-    bpy.context.scene.camera = cams["emergence"]
+    bpy.context.scene.camera = cams["prelude"]
     bpy.context.scene.frame_set(FRAME_START)
 
     save_blend(dirs)
@@ -1630,6 +2095,9 @@ def _parse_cli_args() -> dict:
             opts["previews"] = False
         elif a == "--shot" and i + 1 < len(args):
             opts["shot"] = args[i + 1]
+            i += 1
+        elif a == "--preview-shots" and i + 1 < len(args):
+            PREVIEW_SHOTS.update(x.strip().zfill(2) for x in args[i + 1].split(",") if x.strip())
             i += 1
         i += 1
     return opts
