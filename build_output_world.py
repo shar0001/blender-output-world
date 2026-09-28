@@ -69,6 +69,7 @@ except ImportError as exc:  # Blender 外で import された場合
 # --------------------------------------------------------------------------- #
 PREFIX = "OW_"
 COLLECTION_NAME = "OUTPUT_WORLD"
+SCENE_NAME = PREFIX + "Scene"  # 専用シーン（起動時のデフォルト Cube 等が映り込まない）
 
 GN_GROUP_NAME = PREFIX + "GeometryNodes"
 CUBE_MESH_NAME = PREFIX + "SourceCube"
@@ -139,9 +140,10 @@ FOG_END = 78.0
 FOG_MAX = 0.92
 ACCENT_HEX = "#C9C4FF"  # 粒子・縦ライン
 FOG_NODE_NAME = "OW_Fog"
+FOG_CLEAR_FRAMES = 12  # 05 の閃光 → 06 で霞が晴れるまでのフレーム数
 CHANNEL_Y_END = 14.0  # データチャネル(DIVE)を置くローカル Y の上限
 # ショットごとの霞の距離（カメラ距離が違うため）: (開始m, 終了m)
-FOG_PER_SHOT = {"06": (14.0, 70.0), "07": (8.0, 48.0), "08": (26.0, 88.0), "09": (34.0, 105.0)}
+FOG_PER_SHOT = {"06": (14.0, 70.0), "07": (8.0, 48.0), "08": (26.0, 88.0), "09": (26.0, 95.0)}
 WORLD_LIGHT_STRENGTH = 0.28  # 背景は見た目1.0、照明としては弱く
 PARTICLE_COUNT = 380
 RISE_RATIO = 0.035   # 09 で小キューブ列を立てる塔の割合（中央寄り）
@@ -372,6 +374,28 @@ def purge_previous() -> None:
             scene.timeline_markers.remove(marker)
 
     log.info("前回生成物(OUTPUT_WORLD / %s*)を掃除しました。", PREFIX)
+
+
+def use_output_scene() -> "bpy.types.Scene":
+    """専用シーン OW_Scene を作って（または再利用して）アクティブにする。
+
+    元のシーン（起動時のデフォルト Cube / Light や、ユーザーのオブジェクト）には
+    一切触れず、それらがレンダーに映り込むこともない。
+    """
+    scene = bpy.data.scenes.get(SCENE_NAME) or bpy.data.scenes.new(SCENE_NAME)
+    win = bpy.context.window
+    if win is None and bpy.context.window_manager.windows:
+        win = bpy.context.window_manager.windows[0]
+    if win is not None:
+        win.scene = scene
+    if bpy.context.scene != scene:
+        raise RuntimeError(f"専用シーン {SCENE_NAME} をアクティブにできませんでした。")
+    others = [o.name for o in scene.objects if not o.name.startswith(PREFIX)]
+    if others:
+        log.warning("%s に OW_ 以外のオブジェクトがあります（触れません）: %s",
+                    SCENE_NAME, ", ".join(others[:10]))
+    log.info("専用シーン: %s（元のシーンには触れません）", SCENE_NAME)
+    return scene
 
 
 def get_world_collection() -> "bpy.types.Collection":
@@ -1016,6 +1040,7 @@ def build_geometry_nodes(cfg, accent_mat=None, block_mat=None):
         links.new(ico2.outputs["Mesh"], ico2_m.inputs["Geometry"])
         iop_d = nodes.new("GeometryNodeInstanceOnPoints"); iop_d.location = (2460, -1700)
         links.new(setp.outputs["Geometry"], iop_d.inputs["Points"])
+        links.new(line_prog, iop_d.inputs["Scale"])  # ラインが伸びるまでドットは大きさ0
         links.new(line_vis, iop_d.inputs["Selection"])
         links.new(ico2_m.outputs["Geometry"], iop_d.inputs["Instance"])
         links.new(iop_d.outputs["Instances"], join.inputs[0])
@@ -1492,7 +1517,7 @@ def create_finish(coll, cfg, meta) -> dict:
         return Vector((*_rot2d(lx, ly, ang), z))
 
     orb_mat = bpy.data.materials.get(MAT_ORB_NAME) or create_orb_material(MAT_ORB_NAME, 2.2)
-    orb_pos = W(0.0, 6.0, mh * 2.95)
+    orb_pos = W(0.0, 6.0, mh * 2.2)
     orb_mesh = _make_icosphere(PREFIX + "FinishOrbMesh", 0.85, 4)
     orb_mesh.materials.append(orb_mat)
     orb = bpy.data.objects.new(PREFIX + "FinishOrb", orb_mesh)
@@ -1541,11 +1566,11 @@ def create_finish(coll, cfg, meta) -> dict:
     _key_visible(fan, SHOT_FINISH[0], SHOT_FINISH[1])
 
     # カメラ（正面・やや低め・前景ボケ）
-    tgt = _add_empty(coll, TARGET_FINISH, tuple(W(0.0, 2.0, mh * 1.25)))
+    tgt = _add_empty(coll, TARGET_FINISH, tuple(W(0.0, 2.0, mh * 1.15)))
     cam = _add_camera(coll, CAM_FINISH, 42.0)
     _track_to(cam, tgt)
-    _key_loc(cam, SHOT_FINISH[0], tuple(W(0.0, -36.0, mh * 1.05)))
-    _key_loc(cam, SHOT_FINISH[1], tuple(W(0.0, -33.5, mh * 1.0)))
+    _key_loc(cam, SHOT_FINISH[0], tuple(W(0.0, -28.0, mh * 0.80)))
+    _key_loc(cam, SHOT_FINISH[1], tuple(W(0.0, -25.5, mh * 0.76)))
     _smooth_fcurves(cam)
     cam.data.dof.focus_object = tgt
     cam.data.dof.aperture_fstop = 1.8
@@ -1735,17 +1760,26 @@ def key_fog_per_shot(block_mat) -> None:
     if fog is None:
         log.warning("霞ノードが見つからないためショット別の霞をスキップします。")
         return
-    for key, (start, _end) in (("06", SHOT_EMERGENCE), ("07", SHOT_DIVE), ("08", SHOT_HERO),
-                               ("09", SHOT_FINISH)):
-        f0, f1 = FOG_PER_SHOT[key]
-        fog.inputs["From Min"].default_value = f0
-        fog.inputs["From Max"].default_value = f1
-        fog.inputs["From Min"].keyframe_insert("default_value", frame=start)
-        fog.inputs["From Max"].keyframe_insert("default_value", frame=start)
+    def key(frame, near, far, amount):
+        fog.inputs["From Min"].default_value = near
+        fog.inputs["From Max"].default_value = far
+        fog.inputs["To Max"].default_value = amount
+        for name in ("From Min", "From Max", "To Max"):
+            fog.inputs[name].keyframe_insert("default_value", frame=frame)
+
+    # 06 の頭: 閃光の直後は全体が霞(アイボリー)に包まれ、FOG_CLEAR_FRAMES かけて晴れる
+    clear_to = SHOT_EMERGENCE[0] + FOG_CLEAR_FRAMES
+    key(SHOT_EMERGENCE[0], 0.2, 2.5, 1.0)
+    key(clear_to, *FOG_PER_SHOT["06"], FOG_MAX)
+    for k, (start, _end) in (("07", SHOT_DIVE), ("08", SHOT_HERO), ("09", SHOT_FINISH)):
+        key(start, *FOG_PER_SHOT[k], FOG_MAX)
     n = 0
     for fc in _iter_action_fcurves(block_mat.node_tree):
+        if 'OW_Fog' not in fc.data_path:
+            continue
         for kp in fc.keyframe_points:
-            kp.interpolation = "CONSTANT"
+            # 晴れていく区間だけ補間、それ以外はショット境界で切り替え
+            kp.interpolation = "BEZIER" if int(round(kp.co[0])) == SHOT_EMERGENCE[0] else "CONSTANT"
             n += 1
     log.info("霞(ショット別): %s / キー %d 個(CONSTANT)", FOG_PER_SHOT, n)
 
@@ -2050,6 +2084,7 @@ def build(do_previews: bool = True, v2: bool = True) -> None:
     log.info("Blender %s / OUTPUT_WORLD 構築(v4: 01〜09)を開始します。", bpy.app.version_string)
 
     backup_existing_blend(dirs)
+    use_output_scene()
     purge_previous()
 
     coll = get_world_collection()
