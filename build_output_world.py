@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""build_output_world.py  (art pass v2)
+"""build_output_world.py  (art pass v3)
 
 ストーリーボード後半3カット
   06 OUTPUT EMERGENCE / 07 DIVE THROUGH OUTPUT / 08 HERO REVEAL
@@ -20,6 +20,16 @@ v2 の主な改善:
   * カメラをグリッド軸から約7°ずらし、黒い溝を目立たなくする。
   * 発光球を小型・スムーズ化し Principled+Emission で立体感。
   * プレビューは暖かいアイボリー背景（最終は透過、実行後に設定復元）。
+
+v3（参考ストーリーボードのルックに寄せる）:
+  * 色管理を Standard に固定（AgX による彩度低下を回避）。
+  * 140×140=19,600 ブロックの高密度フィールド（個別オブジェクトは作らない）。
+  * ブロックの縦グラデーション（根元の濃い青 → 電気的ブルー → 頂部ライラック）。
+  * カメラ距離による空気遠近（霞）。距離はショットごとにキー（CONSTANT）。
+  * 背景は見た目アイボリー1.0、照明としては弱い青寄り環境光（Light Path）。
+  * 浮遊粒子・縦データライン+ドット・地面を GN 内で生成（インスタンス / 1メッシュ）。
+  * DIVE 用データチャネルは 07 の間だけ開き、両脇にランダムな高さの壁を立てる。
+  * コンポジタの Glare(Bloom) で発光部をにじませる。
 
 Blender 5.1.2 対応:
   * EEVEE エンジン名を自動選択。
@@ -69,6 +79,8 @@ MAT_ORB_NAME = PREFIX + "Mat_Orb"
 MAT_LINE_NAME = PREFIX + "Mat_DataLine"
 
 RED_ATTR_NAME = "block_red"  # INSTANCE ドメイン属性（Shader は INSTANCER で読む）
+HEIGHT_ATTR_NAME = "block_h"  # 正規化した最終高さ 0..1（頂部の明るさに使う）
+MAT_ACCENT_NAME = PREFIX + "Mat_Accent"
 
 CAM_EMERGENCE = PREFIX + "CAM_06_EMERGENCE"
 CAM_DIVE = PREFIX + "CAM_07_DIVE"
@@ -99,6 +111,26 @@ RES_Y = 1080
 # 色（sRGB hex → 後で linear 変換）
 COBALT_HEX = "#163CFF"
 SIGNAL_RED_HEX = "#FF3048"
+
+# v3 ルック: ブロックの縦グラデーション（根元→中腹→頂部）
+BLOCK_DEEP_HEX = "#1226E6"
+BLOCK_ELECTRIC_HEX = "#3450FF"
+BLOCK_TOP_HEX = "#C2C0FF"
+# 空気遠近（遠景をアイボリー〜ライラックに溶かす）
+BG_IVORY_HEX = "#F4EEE6"
+HAZE_HEX = "#ECE6F4"
+FOG_START = 16.0
+FOG_END = 78.0
+FOG_MAX = 0.92
+ACCENT_HEX = "#C9C4FF"  # 粒子・縦ライン
+FOG_NODE_NAME = "OW_Fog"
+CHANNEL_Y_END = 14.0  # データチャネル(DIVE)を置くローカル Y の上限
+# ショットごとの霞の距離（カメラ距離が違うため）: (開始m, 終了m)
+FOG_PER_SHOT = {"06": (14.0, 70.0), "07": (8.0, 48.0), "08": (26.0, 88.0)}
+WORLD_LIGHT_STRENGTH = 0.28  # 背景は見た目1.0、照明としては弱く
+PARTICLE_COUNT = 380
+LOOKDEV_PREVIEW = True  # プレビューでも DOF/モーションブラーを入れて見た目を確認
+LINE_RATIO = 0.0018
 
 
 # --------------------------------------------------------------------------- #
@@ -391,16 +423,18 @@ def _mix_rgba(nt, loc, fac_socket, color1, color2):
 
 
 def create_block_material(cfg) -> "bpy.types.Material":
-    """鮮やかなコバルトブルー(既定) + シグナルレッド(block_red=1)。
+    """v3 ルック: 根元の濃い青 → 電気的ブルー → 頂部ライラックの縦グラデーション。
 
-    block_red は INSTANCER 属性。読めない場合でも Fac=0 でコバルトになり、
-    グレーにはならない（安全なフォールバック）。
+    * 縦方向: インスタンス元Cubeのローカル座標 z(0..1) = ブロック内の高さ。
+    * 高い塔ほど頂部が明るい（INSTANCER 属性 block_h）。
+    * 赤ノード: INSTANCER 属性 block_red。読めない場合は青のまま（グレーにならない）。
+    * 空気遠近: カメラ距離でアイボリー〜ライラックの霞へ溶かす。
     """
-    cobalt = hex_to_linear_rgba(COBALT_HEX)
+    deep = hex_to_linear_rgba(BLOCK_DEEP_HEX)
+    electric = hex_to_linear_rgba(BLOCK_ELECTRIC_HEX)
+    top = hex_to_linear_rgba(BLOCK_TOP_HEX)
     signal_red = hex_to_linear_rgba(SIGNAL_RED_HEX)
-    # ごく弱い青 Emission（影でも青が残る） / 赤はやや強い赤 Emission
-    blue_emit = (cobalt[0] * 0.6, cobalt[1] * 0.6, cobalt[2] * 0.6, 1.0)
-    red_emit = (signal_red[0], signal_red[1] * 0.4, signal_red[2] * 0.4, 1.0)
+    haze = hex_to_linear_rgba(HAZE_HEX)
 
     mat = bpy.data.materials.new(MAT_BLOCK_NAME)
     mat.use_nodes = True
@@ -409,31 +443,117 @@ def create_block_material(cfg) -> "bpy.types.Material":
     bsdf = _principled(mat)
     out = nodes.get("Material Output")
 
-    attr = nodes.new("ShaderNodeAttribute")
-    attr.attribute_type = "INSTANCER"
-    attr.attribute_name = RED_ATTR_NAME
-    attr.location = (-900, 100)
-    fac = attr.outputs["Fac"]
+    # --- 入力 ---
+    tex = nodes.new("ShaderNodeTexCoord"); tex.location = (-1500, 300)
+    sep = nodes.new("ShaderNodeSeparateXYZ"); sep.location = (-1320, 300)
+    links.new(tex.outputs["Object"], sep.inputs["Vector"])
+    local_z = sep.outputs["Z"]  # 0=根元, 1=頂部
 
-    base_col = _mix_rgba(nt, (-600, 300), fac, cobalt, signal_red)
-    emit_col = _mix_rgba(nt, (-600, -100), fac, blue_emit, red_emit)
+    a_h = nodes.new("ShaderNodeAttribute"); a_h.location = (-1500, 60)
+    a_h.attribute_type = "INSTANCER"
+    a_h.attribute_name = HEIGHT_ATTR_NAME
+    a_red = nodes.new("ShaderNodeAttribute"); a_red.location = (-1500, -160)
+    a_red.attribute_type = "INSTANCER"
+    a_red.attribute_name = RED_ATTR_NAME
+
+    geo = nodes.new("ShaderNodeNewGeometry"); geo.location = (-1500, -380)
+    sep_n = nodes.new("ShaderNodeSeparateXYZ"); sep_n.location = (-1320, -380)
+    links.new(geo.outputs["Normal"], sep_n.inputs["Vector"])
+
+    # --- グラデーション係数 g = z * (0.3 + 0.7*h) + 上面ブースト ---
+    def m(op, loc, a, b=None):
+        n = nodes.new("ShaderNodeMath"); n.operation = op; n.location = loc
+        for i, v in enumerate((a, b)):
+            if v is None:
+                continue
+            if isinstance(v, bpy.types.NodeSocket):
+                links.new(v, n.inputs[i])
+            else:
+                n.inputs[i].default_value = v
+        return n.outputs[0]
+
+    h_w = m("MULTIPLY_ADD", (-1120, 60), a_h.outputs["Fac"], 0.8)
+    h_w.node.inputs[2].default_value = 0.2
+    z2 = m("POWER", (-1120, 240), local_z, 2.0)
+    g = m("MULTIPLY", (-940, 200), z2, h_w)
+    top_face = nodes.new("ShaderNodeMapRange"); top_face.location = (-1120, -380)
+    top_face.inputs["From Min"].default_value = 0.5
+    top_face.inputs["From Max"].default_value = 0.95
+    top_face.inputs["To Min"].default_value = 0.0
+    top_face.inputs["To Max"].default_value = 0.30
+    links.new(sep_n.outputs["Z"], top_face.inputs["Value"])
+    g2 = m("ADD", (-760, 120), g, top_face.outputs["Result"])
+
+    ramp = nodes.new("ShaderNodeValToRGB"); ramp.location = (-580, 160)
+    els = ramp.color_ramp.elements
+    els[0].position = 0.0; els[0].color = deep
+    els[1].position = 1.0; els[1].color = top
+    mid = els.new(0.40); mid.color = electric
+    links.new(g2, ramp.inputs["Fac"])
+
+    col = _mix_rgba(nt, (-300, 200), a_red.outputs["Fac"], (0, 0, 0, 1), signal_red)
+    # A 側を ramp にするため Mix を作り直す
+    mix_node = col.node
+    a_in = next(s for s in mix_node.inputs if s.name == "A" and s.type == "RGBA")
+    links.new(ramp.outputs["Color"], a_in)
+
+    emit_strength = m("MULTIPLY_ADD", (-300, -80), a_red.outputs["Fac"], 2.6)
+    emit_strength.node.inputs[2].default_value = 0.34  # 青=0.34, 赤=2.94
 
     if bsdf is not None:
-        links.new(base_col, bsdf.inputs["Base Color"])
-        bsdf.inputs["Roughness"].default_value = 0.32
+        links.new(col, bsdf.inputs["Base Color"])
+        bsdf.inputs["Roughness"].default_value = 0.42
         if "Metallic" in bsdf.inputs:
-            bsdf.inputs["Metallic"].default_value = 0.10
+            bsdf.inputs["Metallic"].default_value = 0.05
+        if "Specular IOR Level" in bsdf.inputs:
+            bsdf.inputs["Specular IOR Level"].default_value = 0.35
         for ename in ("Emission Color", "Emission"):
             if ename in bsdf.inputs:
-                links.new(emit_col, bsdf.inputs[ename])
+                links.new(col, bsdf.inputs[ename])
                 break
         if "Emission Strength" in bsdf.inputs:
-            bsdf.inputs["Emission Strength"].default_value = 0.6
-        if out is not None:
-            links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+            links.new(emit_strength, bsdf.inputs["Emission Strength"])
 
-    log.info("ブロックマテリアル生成: %s (Cobalt=%s, Red=%s, INSTANCER属性=%s)",
-             MAT_BLOCK_NAME, COBALT_HEX, SIGNAL_RED_HEX, RED_ATTR_NAME)
+    # --- 空気遠近: カメラ距離 → 霞(Emission)へミックス ---
+    cam = nodes.new("ShaderNodeCameraData"); cam.location = (-300, -300)
+    fog = nodes.new("ShaderNodeMapRange"); fog.location = (-120, -300)
+    fog.name = FOG_NODE_NAME
+    fog.interpolation_type = "SMOOTHSTEP"
+    fog.inputs["From Min"].default_value = FOG_START
+    fog.inputs["From Max"].default_value = FOG_END
+    fog.inputs["To Min"].default_value = 0.0
+    fog.inputs["To Max"].default_value = FOG_MAX
+    links.new(cam.outputs["View Distance"], fog.inputs["Value"])
+    haze_em = nodes.new("ShaderNodeEmission"); haze_em.location = (60, -200)
+    haze_em.inputs["Color"].default_value = haze
+    haze_em.inputs["Strength"].default_value = 1.0
+    mix_sh = nodes.new("ShaderNodeMixShader"); mix_sh.location = (260, 0)
+    links.new(fog.outputs["Result"], mix_sh.inputs["Fac"])
+    if bsdf is not None:
+        links.new(bsdf.outputs["BSDF"], mix_sh.inputs[1])
+    links.new(haze_em.outputs["Emission"], mix_sh.inputs[2])
+    if out is not None:
+        out.location = (460, 0)
+        links.new(mix_sh.outputs["Shader"], out.inputs["Surface"])
+
+    log.info("ブロックマテリアル生成(v3): %s 縦グラデ %s→%s→%s, Red=%s, 霞 %.0f〜%.0fm",
+             MAT_BLOCK_NAME, BLOCK_DEEP_HEX, BLOCK_ELECTRIC_HEX, BLOCK_TOP_HEX,
+             SIGNAL_RED_HEX, FOG_START, FOG_END)
+    return mat
+
+
+def create_accent_material() -> "bpy.types.Material":
+    """浮遊粒子・縦ライン・ドット用の淡いライラック発光（GN の Set Material で使う）。"""
+    mat = bpy.data.materials.new(MAT_ACCENT_NAME)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    for n in list(nt.nodes):
+        nt.nodes.remove(n)
+    out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (200, 0)
+    emis = nt.nodes.new("ShaderNodeEmission"); emis.location = (0, 0)
+    emis.inputs["Color"].default_value = hex_to_linear_rgba(ACCENT_HEX)
+    emis.inputs["Strength"].default_value = 2.2
+    nt.links.new(emis.outputs["Emission"], out.inputs["Surface"])
     return mat
 
 
@@ -552,11 +672,27 @@ def _random_float(nt, loc, seed, id_socket, vmin=0.0, vmax=1.0):
 # --------------------------------------------------------------------------- #
 # Geometry Nodes 本体                                                          #
 # --------------------------------------------------------------------------- #
-def build_geometry_nodes(cfg) -> "bpy.types.NodeTree":
+def _store_attr(nt, loc, geo_socket, name, value_socket, domain):
+    n = nt.nodes.new("GeometryNodeStoreNamedAttribute")
+    n.location = loc
+    n.data_type = "FLOAT"
+    n.domain = domain
+    n.inputs["Name"].default_value = name
+    val = next(s for s in n.inputs if s.name == "Value" and s.type == "VALUE")
+    nt.links.new(geo_socket, n.inputs["Geometry"])
+    nt.links.new(value_socket, val)
+    return n.outputs["Geometry"]
+
+
+def build_geometry_nodes(cfg, accent_mat=None, block_mat=None):
     """Grid → Mesh to Points → Instance on Points（Realize 不使用）。
 
-    高さ = 3つの非対称ピーク × (低/中周波ノイズ) × 前中後リズム × データチャネル。
-    立ち上がりは中心から外へ広がる波 + easeOutBack オーバーシュート + 時間差。
+    v3:
+      * 高さ = 3つの非対称ピーク × 低/中周波ノイズ + 細い尖塔 × 前中後リズム
+        × データチャネル（両脇は壁として高くする）。
+      * 立ち上がり: 中心から外への波 + easeOutBack + 時間差。
+      * 属性: block_red / block_h（INSTANCE ドメイン, Shader は INSTANCER で読む）。
+      * 装飾: 浮遊粒子と縦データライン+ドット（どれもインスタンス, 個別オブジェクト無し）。
     """
     ng = bpy.data.node_groups.new(GN_GROUP_NAME, "GeometryNodeTree")
     new_interface_socket(ng, "Geometry", "INPUT", "NodeSocketGeometry")
@@ -564,30 +700,34 @@ def build_geometry_nodes(cfg) -> "bpy.types.NodeTree":
     nodes, links = ng.nodes, ng.links
 
     n_in = nodes.new("NodeGroupInput"); n_in.location = (-1700, 0)
-    n_out = nodes.new("NodeGroupOutput"); n_out.location = (1900, 0)
+    n_out = nodes.new("NodeGroupOutput"); n_out.location = (2600, 0)
 
     gx, gy = cfg["grid_x"], cfg["grid_y"]
     spacing = cfg["spacing"]
     size_x = (gx - 1) * spacing
     size_y = (gy - 1) * spacing
+    hx, hy = size_x * 0.5, size_y * 0.5
     max_radius = 0.5 * math.hypot(size_x, size_y)
     block_w = spacing * BLOCK_FILL
-    band = max(spacing * 5.0, 1e-3)
+    band = max(max_radius * 0.18, spacing * 5.0)
     ns = cfg["noise_strength"]
     cps = cfg["center_peak_strength"]
     seed = cfg["random_seed"]
+    mh = cfg["max_height"]
 
-    # データチャネル（DIVE 用の低ブロック帯）: フィールド右寄りのローカル X
-    channel_x = 0.20 * size_x
-    channel_inner = spacing * 1.6
-    channel_outer = spacing * 3.2
-    channel_low = 0.22  # チャネル内の高さ係数（0=空洞ではなく低ブロックを残す）
+    # データチャネル（DIVE 用）: メートル単位
+    channel_x = -hx + round((0.20 * size_x + hx) / spacing) * spacing  # ブロック列の中心に合わせる
+    channel_inner = 0.9
+    channel_outer = 2.0
+    channel_low = 0.16
+    wall_height = mh * 0.38   # 通路の両脇に立つ壁（パララックス用）
+    wall_reach = 4.5
 
-    # 3つの非対称ピーク（ローカル座標, 半径, 高さ係数）
+    # 3つの非対称ピーク（半サイズに対する比率, 半径は max_radius 比）
     peaks = [
-        (-1.0 * spacing, 0.5 * spacing, 0.42 * max_radius, 1.00),   # 主ピーク(中景)
-        (-7.0 * spacing, -7.0 * spacing, 0.30 * max_radius, 0.85),  # 前景の大ブロック
-        (-5.0 * spacing, 10.0 * spacing, 0.34 * max_radius, 0.62),  # 遠景の低い構造
+        (-0.06 * hx, 0.05 * hy, 0.40 * max_radius, 1.00),   # 主ピーク(中景)
+        (-0.46 * hx, -0.42 * hy, 0.26 * max_radius, 0.80),  # 前景の大ブロック
+        (-0.30 * hx, 0.62 * hy, 0.34 * max_radius, 0.70),   # 遠景の尾根
     ]
 
     # --- Grid → Points ---
@@ -605,30 +745,28 @@ def build_geometry_nodes(cfg) -> "bpy.types.NodeTree":
     links.new(pos.outputs["Position"], sep.inputs["Vector"])
     xsock, ysock = sep.outputs["X"], sep.outputs["Y"]
     pos_xy = _combine(nt=ng, loc=(-1140, -300), x=xsock, y=ysock, z=0.0)
-
     dist_c = nodes.new("ShaderNodeVectorMath"); dist_c.operation = "LENGTH"
     dist_c.location = (-960, -360)
     links.new(pos_xy.outputs["Vector"], dist_c.inputs[0])
     dist_center = dist_c.outputs["Value"]
-
     idx = nodes.new("GeometryNodeInputIndex"); idx.location = (-1500, -560)
+    stime = nodes.new("GeometryNodeInputSceneTime"); stime.location = (-780, -460)
+    # データチャネルは DIVE ショット中だけ開く（06/08 では通路の縞が見えない）
+    ch_on_a = _M(ng, "GREATER_THAN", (-600, -760), stime.outputs["Frame"], SHOT_DIVE[0] - 0.5)
+    ch_on_b = _M(ng, "LESS_THAN", (-600, -840), stime.outputs["Frame"], SHOT_DIVE[1] + 0.5)
+    ch_on = _M(ng, "MULTIPLY", (-440, -800), ch_on_a, ch_on_b)
 
     # --- 低周波 / 中周波ノイズ ---
     noise_lo = nodes.new("ShaderNodeTexNoise"); noise_lo.location = (-1140, 120)
-    if "Scale" in noise_lo.inputs:
-        noise_lo.inputs["Scale"].default_value = cfg["noise_scale"] * 0.5
-    if "Detail" in noise_lo.inputs:
-        noise_lo.inputs["Detail"].default_value = 2.0
+    noise_lo.inputs["Scale"].default_value = cfg["noise_scale"] * 0.5
+    noise_lo.inputs["Detail"].default_value = 2.0
     links.new(pos.outputs["Position"], noise_lo.inputs["Vector"])
-
     noise_mid = nodes.new("ShaderNodeTexNoise"); noise_mid.location = (-1140, -60)
-    if "Scale" in noise_mid.inputs:
-        noise_mid.inputs["Scale"].default_value = cfg["noise_scale"] * 1.7
-    if "Detail" in noise_mid.inputs:
-        noise_mid.inputs["Detail"].default_value = 3.0
+    noise_mid.inputs["Scale"].default_value = cfg["noise_scale"] * 2.2
+    noise_mid.inputs["Detail"].default_value = 3.0
     links.new(pos.outputs["Position"], noise_mid.inputs["Vector"])
 
-    # --- 3ピークの合成（max） ---
+    # --- 3ピーク（max） ---
     peak_outs = []
     for i, (px, py, pr, ph) in enumerate(peaks):
         pk_pos = _combine(nt=ng, loc=(-960, 400 - i * 120), x=px, y=py, z=0.0)
@@ -636,109 +774,241 @@ def build_geometry_nodes(cfg) -> "bpy.types.NodeTree":
         pd.location = (-780, 400 - i * 120)
         links.new(pos_xy.outputs["Vector"], pd.inputs[0])
         links.new(pk_pos.outputs["Vector"], pd.inputs[1])
-        fall = _map_range(ng, (-600, 400 - i * 120), pd.outputs["Value"],
-                          0.0, pr, ph, 0.0, interp="SMOOTHSTEP", clamp=True)
-        peak_outs.append(fall)
+        peak_outs.append(_map_range(ng, (-600, 400 - i * 120), pd.outputs["Value"],
+                                    0.0, pr, ph, 0.0, interp="SMOOTHSTEP", clamp=True))
     peaks_max = _M(ng, "MAXIMUM", (-400, 420), peak_outs[0], peak_outs[1])
     peaks_max = _M(ng, "MAXIMUM", (-260, 420), peaks_max, peak_outs[2])
 
     # --- 高さ合成 ---
-    nl = _M(ng, "MULTIPLY", (-780, 120), noise_lo.outputs["Fac"], 0.25 * ns)
-    nm_half = _M(ng, "MULTIPLY", (-780, -20), noise_mid.outputs["Fac"], 0.5 * ns)
-    nm_text = _M(ng, "ADD", (-600, -20), nm_half, 0.5)
+    nl = _M(ng, "MULTIPLY", (-780, 120), noise_lo.outputs["Fac"], 0.22 * ns)
+    nm_half = _M(ng, "MULTIPLY", (-780, -20), noise_mid.outputs["Fac"], 0.6 * ns)
+    nm_text = _M(ng, "ADD", (-600, -20), nm_half, 0.4)
     mount = _M(ng, "MULTIPLY", (-120, 300), peaks_max, nm_text)
     mount2 = _M(ng, "MULTIPLY", (40, 300), mount, cps)
     rnd_h = _random_float(ng, (-780, -220), seed + 3, idx.outputs["Index"])
-    rnd_term = _M(ng, "MULTIPLY", (-600, -220), rnd_h, 0.08)
+    rnd_term = _M(ng, "MULTIPLY", (-600, -220), rnd_h, 0.10)
+    # 細い尖塔（ピーク域の約5%を持ち上げる）
+    rnd_sp = _random_float(ng, (-780, -330), seed + 19, idx.outputs["Index"])
+    is_sp = _M(ng, "LESS_THAN", (-600, -330), rnd_sp, 0.05)
+    sp_amt = _M(ng, "MULTIPLY", (-440, -330), is_sp, peaks_max)
+    sp_term = _M(ng, "MULTIPLY", (-280, -330), sp_amt, 0.55)
     hsum = _M(ng, "ADD", (200, 200), nl, mount2)
     hsum2 = _M(ng, "ADD", (360, 200), hsum, rnd_term)
-    h01 = _clamp01(ng, (520, 200), hsum2)
-    h_scaled = _M(ng, "MULTIPLY", (680, 200), h01, cfg["max_height"] - cfg["min_height"])
+    hsum3 = _M(ng, "ADD", (440, 120), hsum2, sp_term)
+    h01 = _clamp01(ng, (520, 200), hsum3)
+    h_scaled = _M(ng, "MULTIPLY", (680, 200), h01, mh - cfg["min_height"])
     height = _M(ng, "ADD", (840, 200), h_scaled, cfg["min_height"])
 
-    # --- 前中後の高さリズム（Y でうねり） ---
-    ymul = _M(ng, "MULTIPLY", (200, -40), ysock, 0.35)
+    # --- 前中後の高さリズム ---
+    ymul = _M(ng, "MULTIPLY", (200, -40), ysock, 6.0 / max(size_y, 1e-3))
     ysin = _M(ng, "SINE", (360, -40), ymul, None)
     ysc = _M(ng, "MULTIPLY", (520, -40), ysin, 0.15)
     depth_mod = _M(ng, "ADD", (680, -40), ysc, 0.85)
     h_a = _M(ng, "MULTIPLY", (1000, 160), height, depth_mod)
 
-    # --- データチャネル（|x - channel_x| が小さいほど低く） ---
+    # --- データチャネル + 両脇の壁 ---
     dxc = _M(ng, "SUBTRACT", (200, -200), xsock, channel_x)
     absdxc = _M(ng, "ABSOLUTE", (360, -200), dxc, None)
-    channel_factor = _map_range(ng, (520, -200), absdxc,
-                                channel_inner, channel_outer, channel_low, 1.0,
-                                interp="SMOOTHSTEP", clamp=True)
-    h_b = _M(ng, "MULTIPLY", (1160, 120), h_a, channel_factor)
+    wall_add = _map_range(ng, (520, -120), absdxc, channel_outer, channel_outer + wall_reach,
+                          wall_height, 0.0, interp="SMOOTHSTEP", clamp=True)
+    rnd_wall = _random_float(ng, (700, -120), seed + 41, idx.outputs["Index"], 0.25, 1.35)
+    wall_var0 = _M(ng, "MULTIPLY", (860, -120), wall_add, rnd_wall)
+    ymask_w0 = _map_range(ng, (700, -40), ysock, CHANNEL_Y_END, CHANNEL_Y_END + 8.0,
+                          1.0, 0.0, interp="SMOOTHSTEP", clamp=True)
+    ymask_w = _M(ng, "MULTIPLY", (820, -40), ymask_w0, ch_on)
+    wall_var = _M(ng, "MULTIPLY", (940, -120), wall_var0, ymask_w)
+    h_w = _M(ng, "ADD", (1080, 60), h_a, wall_var)
+    channel_factor = _map_range(ng, (520, -200), absdxc, channel_inner, channel_outer,
+                                channel_low, 1.0, interp="SMOOTHSTEP", clamp=True)
+    ymask0 = _map_range(ng, (700, -300), ysock, CHANNEL_Y_END, CHANNEL_Y_END + 8.0,
+                        1.0, 0.0, interp="SMOOTHSTEP", clamp=True)
+    ymask = _M(ng, "MULTIPLY", (780, -360), ymask0, ch_on)
+    cf_inv = _M(ng, "SUBTRACT", (860, -300), 1.0, channel_factor)
+    cf_m = _M(ng, "MULTIPLY", (1000, -300), cf_inv, ymask)
+    channel_eff = _M(ng, "SUBTRACT", (1140, -300), 1.0, cf_m)
+    h_b = _M(ng, "MULTIPLY", (1160, 120), h_w, channel_eff)
 
-    # --- 生成の波（Scene Time → build_radius → local_t） ---
-    stime = nodes.new("GeometryNodeInputSceneTime"); stime.location = (-780, -420)
-    build_prog = _map_range(ng, (-600, -420), stime.outputs["Frame"],
+    # --- 生成の波 ---
+    build_prog = _map_range(ng, (-600, -460), stime.outputs["Frame"],
                             cfg["build_start_frame"], cfg["build_end_frame"], 0.0, 1.0,
                             interp="SMOOTHSTEP", clamp=True)
-    build_radius = _M(ng, "MULTIPLY", (-420, -420), build_prog, max_radius + band)
-    t_wave = _M(ng, "SUBTRACT", (-260, -420), build_radius, dist_center)
-    local_t = _M(ng, "DIVIDE", (-100, -420), t_wave, band)
-    rnd_stag = _random_float(ng, (-260, -560), seed + 11, idx.outputs["Index"])
-    jitter = _M(ng, "MULTIPLY", (-100, -560), rnd_stag, 0.15)  # 時間差(余韻)
-    t_jit = _M(ng, "ADD", (60, -480), local_t, jitter)
-    p = _clamp01(ng, (220, -480), t_jit)
-
-    # easeOutBack: f = 1 + c1*u^2 + c3*u^3 ,  u = p - 1（軽いオーバーシュート）
-    u = _M(ng, "SUBTRACT", (380, -480), p, 1.0)
-    u2 = _M(ng, "MULTIPLY", (540, -520), u, u)
-    u3 = _M(ng, "MULTIPLY", (540, -600), u2, u)
-    c1t = _M(ng, "MULTIPLY", (700, -520), u2, 1.70158)
-    c3t = _M(ng, "MULTIPLY", (700, -600), u3, 2.70158)
-    s1 = _M(ng, "ADD", (860, -540), c1t, c3t)
-    f_over = _M(ng, "ADD", (1020, -540), s1, 1.0)
+    build_radius = _M(ng, "MULTIPLY", (-420, -460), build_prog, max_radius + band)
+    t_wave = _M(ng, "SUBTRACT", (-260, -460), build_radius, dist_center)
+    local_t = _M(ng, "DIVIDE", (-100, -460), t_wave, band)
+    rnd_stag = _random_float(ng, (-260, -600), seed + 11, idx.outputs["Index"])
+    jitter = _M(ng, "MULTIPLY", (-100, -600), rnd_stag, 0.35)
+    t_jit = _M(ng, "SUBTRACT", (60, -520), local_t, jitter)
+    p = _clamp01(ng, (220, -520), t_jit)
+    u = _M(ng, "SUBTRACT", (380, -520), p, 1.0)
+    u2 = _M(ng, "MULTIPLY", (540, -560), u, u)
+    u3 = _M(ng, "MULTIPLY", (540, -640), u2, u)
+    c1t = _M(ng, "MULTIPLY", (700, -560), u2, 1.70158)
+    c3t = _M(ng, "MULTIPLY", (700, -640), u3, 2.70158)
+    s1 = _M(ng, "ADD", (860, -580), c1t, c3t)
+    f_over = _M(ng, "ADD", (1020, -580), s1, 1.0)
 
     z_scale = _M(ng, "MULTIPLY", (1340, 40), h_b, f_over)
     scale_vec = _combine(nt=ng, loc=(1500, 40), x=block_w, y=block_w, z=z_scale)
 
-    # --- Object Info（ソースCube） ---
+    # 高さを点に保存（縦ライン用に後で読む）
+    pts = _store_attr(ng, (1340, 480), m2p.outputs["Points"], "ow_z", z_scale, "POINT")
+
+    # --- ブロック本体 ---
     obj_info = nodes.new("GeometryNodeObjectInfo"); obj_info.location = (1340, 320)
     obj_info.inputs["As Instance"].default_value = True
     base = bpy.data.objects.get(CUBE_OBJ_NAME)
     if base is not None:
         obj_info.inputs["Object"].default_value = base
-
-    # --- Instance on Points ---
     iop = nodes.new("GeometryNodeInstanceOnPoints"); iop.location = (1600, 260)
-    links.new(m2p.outputs["Points"], iop.inputs["Points"])
+    links.new(pts, iop.inputs["Points"])
     links.new(obj_info.outputs["Geometry"], iop.inputs["Instance"])
     links.new(scale_vec.outputs["Vector"], iop.inputs["Scale"])
 
-    # --- 赤選択を INSTANCE ドメインへ保存（Shader は INSTANCER で読む） ---
     idx2 = nodes.new("GeometryNodeInputIndex"); idx2.location = (1600, -220)
     rnd_red = _random_float(ng, (1600, -360), seed + 7, idx2.outputs["Index"])
     red_test = _M(ng, "LESS_THAN", (1760, -300), rnd_red, cfg["red_ratio"])
-    store = nodes.new("GeometryNodeStoreNamedAttribute"); store.location = (1760, 260)
-    store.data_type = "FLOAT"
-    store.domain = "INSTANCE"
-    store.inputs["Name"].default_value = RED_ATTR_NAME
-    store_val = next(s for s in store.inputs if s.name == "Value" and s.type == "VALUE")
-    links.new(iop.outputs["Instances"], store.inputs["Geometry"])
-    links.new(red_test, store_val)
-    links.new(store.outputs["Geometry"], n_out.inputs[0])
+    blocks = _store_attr(ng, (1760, 260), iop.outputs["Instances"], RED_ATTR_NAME,
+                         red_test, "INSTANCE")
+    blocks = _store_attr(ng, (1920, 260), blocks, HEIGHT_ATTR_NAME, h01, "INSTANCE")
+
+    join = nodes.new("GeometryNodeJoinGeometry"); join.location = (2400, 0)
+    links.new(blocks, join.inputs[0])
+
+    # 地面: ブロック間のすき間から背景が透けて「溝」に見えるのを防ぐ
+    ground = nodes.new("GeometryNodeMeshGrid"); ground.location = (1920, 520)
+    ground.inputs["Size X"].default_value = size_x + spacing * 2.0
+    ground.inputs["Size Y"].default_value = size_y + spacing * 2.0
+    ground.inputs["Vertices X"].default_value = 2
+    ground.inputs["Vertices Y"].default_value = 2
+    if block_mat is not None:
+        g_m = nodes.new("GeometryNodeSetMaterial"); g_m.location = (2100, 520)
+        g_m.inputs["Material"].default_value = block_mat
+        links.new(ground.outputs["Mesh"], g_m.inputs["Geometry"])
+        links.new(g_m.outputs["Geometry"], join.inputs[0])
+    else:
+        links.new(ground.outputs["Mesh"], join.inputs[0])
+
+    if accent_mat is not None:
+        # --- 浮遊粒子（06 の上空に漂うデータ） ---
+        cloud = nodes.new("GeometryNodePoints"); cloud.location = (1340, -900)
+        cloud.inputs["Count"].default_value = PARTICLE_COUNT
+        idx3 = nodes.new("GeometryNodeInputIndex"); idx3.location = (1000, -1000)
+        rv = nodes.new("FunctionNodeRandomValue"); rv.location = (1160, -1000)
+        rv.data_type = "FLOAT_VECTOR"
+        vmin = next(s for s in rv.inputs if s.name == "Min" and s.type == "VECTOR")
+        vmax = next(s for s in rv.inputs if s.name == "Max" and s.type == "VECTOR")
+        vseed = next(s for s in rv.inputs if s.name == "Seed")
+        vid = next(s for s in rv.inputs if s.name == "ID")
+        vout = next(s for s in rv.outputs if s.name == "Value" and s.type == "VECTOR")
+        vmin.default_value = (-0.28 * hx, -0.05 * hy, mh * 0.60)
+        vmax.default_value = (0.22 * hx, 0.50 * hy, mh * 1.9)
+        vseed.default_value = seed + 31
+        links.new(idx3.outputs["Index"], vid)
+        drift = _M(ng, "MULTIPLY", (1160, -1150), stime.outputs["Frame"], 0.02)
+        drift_v = _combine(nt=ng, loc=(1300, -1150), x=0.0, y=0.0, z=drift)
+        vsum = nodes.new("ShaderNodeVectorMath"); vsum.operation = "ADD"
+        vsum.location = (1300, -1020)
+        links.new(vout, vsum.inputs[0])
+        links.new(drift_v.outputs["Vector"], vsum.inputs[1])
+        links.new(vsum.outputs["Vector"], cloud.inputs["Position"])
+        # 粒子はビルドと一緒に現れる
+        dot_scale = _M(ng, "MULTIPLY", (1500, -1150), build_prog, 1.0)
+
+        ico = nodes.new("GeometryNodeMeshIcoSphere"); ico.location = (1500, -860)
+        ico.inputs["Radius"].default_value = 0.045
+        ico.inputs["Subdivisions"].default_value = 1
+        ico_m = nodes.new("GeometryNodeSetMaterial"); ico_m.location = (1660, -860)
+        ico_m.inputs["Material"].default_value = accent_mat
+        links.new(ico.outputs["Mesh"], ico_m.inputs["Geometry"])
+        iop_p = nodes.new("GeometryNodeInstanceOnPoints"); iop_p.location = (1820, -900)
+        links.new(cloud.outputs["Points"], iop_p.inputs["Points"])
+        links.new(ico_m.outputs["Geometry"], iop_p.inputs["Instance"])
+        rnd_ps = _random_float(ng, (1660, -1040), seed + 37, idx3.outputs["Index"], 0.4, 1.6)
+        ps = _M(ng, "MULTIPLY", (1820, -1100), rnd_ps, dot_scale)
+        links.new(ps, iop_p.inputs["Scale"])
+        links.new(iop_p.outputs["Instances"], join.inputs[0])
+
+        # --- 縦データライン + 頂部ドット（08 のシステム感） ---
+        idx4 = nodes.new("GeometryNodeInputIndex"); idx4.location = (1000, -1400)
+        rnd_l = _random_float(ng, (1160, -1400), seed + 23, idx4.outputs["Index"])
+        is_line0 = _M(ng, "LESS_THAN", (1320, -1400), rnd_l, LINE_RATIO)
+        off_ch = _M(ng, "GREATER_THAN", (1320, -1480), absdxc, channel_outer + 1.0)
+        is_line = _M(ng, "MULTIPLY", (1440, -1440), is_line0, off_ch)  # 通路内には立てない
+        sel = nodes.new("GeometryNodeSeparateGeometry"); sel.location = (1500, -1300)
+        sel.domain = "POINT"
+        links.new(pts, sel.inputs["Geometry"])
+        links.new(is_line, sel.inputs["Selection"])
+        sub = sel.outputs["Selection"]
+
+        named = nodes.new("GeometryNodeInputNamedAttribute"); named.location = (1500, -1500)
+        named.data_type = "FLOAT"
+        named.inputs["Name"].default_value = "ow_z"
+        z_attr = next(s for s in named.outputs if s.name == "Attribute")
+        idx5 = nodes.new("GeometryNodeInputIndex"); idx5.location = (1500, -1620)
+        extra = _random_float(ng, (1660, -1620), seed + 29, idx5.outputs["Index"],
+                              mh * 0.3, mh * 1.0)
+        line_prog = _map_range(ng, (1660, -1760), stime.outputs["Frame"],
+                               cfg["build_end_frame"], cfg["build_end_frame"] + 30, 0.0, 1.0,
+                               interp="SMOOTHSTEP", clamp=True)
+        extra_b = _M(ng, "MULTIPLY", (1820, -1620), extra, line_prog)
+        line_len = _M(ng, "ADD", (1980, -1560), z_attr, extra_b)
+
+        cyl = nodes.new("GeometryNodeMeshCylinder"); cyl.location = (1660, -1250)
+        cyl.inputs["Vertices"].default_value = 6
+        cyl.inputs["Radius"].default_value = 0.012
+        cyl.inputs["Depth"].default_value = 1.0
+        xf = nodes.new("GeometryNodeTransform"); xf.location = (1820, -1250)
+        xf.inputs["Translation"].default_value = (0.0, 0.0, 0.5)  # 底面を z=0 へ
+        links.new(cyl.outputs["Mesh"], xf.inputs["Geometry"])
+        cyl_m = nodes.new("GeometryNodeSetMaterial"); cyl_m.location = (1980, -1250)
+        cyl_m.inputs["Material"].default_value = accent_mat
+        links.new(xf.outputs["Geometry"], cyl_m.inputs["Geometry"])
+        l_scale = _combine(nt=ng, loc=(2140, -1500), x=1.0, y=1.0, z=line_len)
+        iop_l = nodes.new("GeometryNodeInstanceOnPoints"); iop_l.location = (2140, -1300)
+        links.new(sub, iop_l.inputs["Points"])
+        line_vis = _M(ng, "GREATER_THAN", (1980, -1400), line_prog, 0.02)
+        links.new(line_vis, iop_l.inputs["Selection"])
+        links.new(cyl_m.outputs["Geometry"], iop_l.inputs["Instance"])
+        links.new(l_scale.outputs["Vector"], iop_l.inputs["Scale"])
+        links.new(iop_l.outputs["Instances"], join.inputs[0])
+
+        top_off = _combine(nt=ng, loc=(2140, -1700), x=0.0, y=0.0, z=line_len)
+        setp = nodes.new("GeometryNodeSetPosition"); setp.location = (2300, -1650)
+        links.new(sub, setp.inputs["Geometry"])
+        links.new(top_off.outputs["Vector"], setp.inputs["Offset"])
+        ico2 = nodes.new("GeometryNodeMeshIcoSphere"); ico2.location = (2140, -1850)
+        ico2.inputs["Radius"].default_value = 0.09
+        ico2.inputs["Subdivisions"].default_value = 2
+        ico2_m = nodes.new("GeometryNodeSetMaterial"); ico2_m.location = (2300, -1850)
+        ico2_m.inputs["Material"].default_value = accent_mat
+        links.new(ico2.outputs["Mesh"], ico2_m.inputs["Geometry"])
+        iop_d = nodes.new("GeometryNodeInstanceOnPoints"); iop_d.location = (2460, -1700)
+        links.new(setp.outputs["Geometry"], iop_d.inputs["Points"])
+        links.new(line_vis, iop_d.inputs["Selection"])
+        links.new(ico2_m.outputs["Geometry"], iop_d.inputs["Instance"])
+        links.new(iop_d.outputs["Instances"], join.inputs[0])
+
+    links.new(join.outputs["Geometry"], n_out.inputs[0])
 
     approx_red = int(round(gx * gy * cfg["red_ratio"]))
-    log.info("GN構築: grid=%dx%d (=%d instances), peaks=3, channel_x=%.1f, "
-             "赤ノード概算=%d (%.1f%%)",
-             gx, gy, gx * gy, channel_x, approx_red, cfg["red_ratio"] * 100.0)
+    log.info("GN構築(v3): grid=%dx%d (=%d blocks), 粒子=%d, 縦ライン≈%d, 赤≈%d (%.1f%%), "
+             "field=%.1fx%.1fm",
+             gx, gy, gx * gy, PARTICLE_COUNT, int(gx * gy * LINE_RATIO), approx_red,
+             cfg["red_ratio"] * 100.0, size_x, size_y)
     return ng, {"channel_x": channel_x, "field_rot": math.radians(FIELD_ROT_Z_DEG),
-                "size_x": size_x, "size_y": size_y, "max_radius": max_radius}
+                "size_x": size_x, "size_y": size_y, "max_radius": max_radius,
+                "wall_height": wall_height}
 
 
-def create_field_object(coll, cfg):
+def create_field_object(coll, cfg, accent_mat=None, block_mat=None):
     """空メッシュ + GN modifier のフィールド。マテリアルはソースCubeへ割当済み。"""
     mesh = bpy.data.meshes.new(PREFIX + "FieldMesh")
     obj = bpy.data.objects.new(FIELD_OBJ_NAME, mesh)
     obj.location = (0.0, 0.0, 0.0)
-    obj.rotation_euler = (0.0, 0.0, math.radians(FIELD_ROT_Z_DEG))  # グリッド軸をずらす
+    obj.rotation_euler = (0.0, 0.0, math.radians(FIELD_ROT_Z_DEG))
     link_to_world(coll, obj)
 
-    ng, meta = build_geometry_nodes(cfg)
+    ng, meta = build_geometry_nodes(cfg, accent_mat, block_mat)
     mod = obj.modifiers.new(name="OW_GeometryNodes", type="NODES")
     mod.node_group = ng
     return obj, meta
@@ -778,15 +1048,15 @@ def _make_icosphere(name, radius, subdiv=4):
 def create_hero_orbs(coll, cfg, meta) -> list:
     """主球体1個 + 遠景の小球体1〜2個。フィールド回転に合わせて配置。"""
     ang = meta["field_rot"]
-    mat_main = create_orb_material(MAT_ORB_NAME, emit_strength=6.0)
-    mat_far = create_orb_material(MAT_ORB_NAME + "_Far", emit_strength=2.4)
+    mat_main = create_orb_material(MAT_ORB_NAME, emit_strength=2.2)
+    mat_far = create_orb_material(MAT_ORB_NAME + "_Far", emit_strength=1.4)
     mh = cfg["max_height"]
 
     # (localX, localY, z, radius, material, subdiv)
     specs = [
-        (-1.0, 1.0, mh * 0.92, 0.62, mat_main, 4),     # 主球体（中景, 小さめ）
-        (7.0, -8.0, mh * 0.70, 0.30, mat_far, 3),      # 遠景 小
-        (-8.0, 11.0, mh * 0.60, 0.24, mat_far, 3),     # 遠景 小
+        (-3.0, 9.0, mh * 1.05, 0.55, mat_main, 4),     # 主球体（中景, 小さめ）
+        (9.0, 16.0, mh * 0.80, 0.30, mat_far, 3),      # 遠景 小
+        (-12.0, 20.0, mh * 0.70, 0.26, mat_far, 3),    # 遠景 小
     ]
     orbs = []
     for i, (lx, ly, z, r, mat, sub) in enumerate(specs[:HERO_ORB_COUNT]):
@@ -806,8 +1076,7 @@ def create_data_lines(coll, cfg, meta, main_orb) -> list:
     ang = meta["field_rot"]
     made = []
     # 主球体近傍から、フィールド上の2点（ローカル）へ
-    targets_local = [(-1.0, -3.0, cfg["max_height"] * 0.35),
-                     (3.0, 3.0, cfg["max_height"] * 0.30)]
+    targets_local = [(-3.0, 9.0, 0.0)]  # 主球体の真下へ1本（縦ラインのモチーフに揃える）
     start = Vector(main_orb.location)
     for i, (lx, ly, lz) in enumerate(targets_local):
         wx, wy = _rot2d(lx, ly, ang)
@@ -844,7 +1113,8 @@ def create_lights(coll, cfg) -> list:
     key_data.shape = "RECTANGLE"
     key_data.size = 40.0
     key_data.size_y = 24.0
-    key_data.energy = 5000.0
+    key_data.energy = 3800.0
+    key_data.color = (0.86, 0.86, 1.0)
     key = bpy.data.objects.new(PREFIX + "Key", key_data)
     key.location = (-18.0, -22.0, 34.0)
     key.rotation_euler = (math.radians(52), 0.0, math.radians(-32))
@@ -855,7 +1125,7 @@ def create_lights(coll, cfg) -> list:
     fill_data.shape = "RECTANGLE"
     fill_data.size = 30.0
     fill_data.size_y = 20.0
-    fill_data.energy = 1100.0
+    fill_data.energy = 700.0
     fill = bpy.data.objects.new(PREFIX + "Fill", fill_data)
     fill.location = (24.0, -10.0, 18.0)
     fill.rotation_euler = (math.radians(68), 0.0, math.radians(48))
@@ -865,10 +1135,22 @@ def create_lights(coll, cfg) -> list:
     world = bpy.data.worlds.get(PREFIX + "World") or bpy.data.worlds.new(PREFIX + "World")
     bpy.context.scene.world = world
     world.use_nodes = True
-    bg = world.node_tree.nodes.get("Background")
-    if bg is not None:
-        bg.inputs["Color"].default_value = (0.95, 0.93, 0.88, 1.0)
-        bg.inputs["Strength"].default_value = 0.35
+    wn, wl = world.node_tree.nodes, world.node_tree.links
+    bg = wn.get("Background")
+    wout = wn.get("World Output")
+    ivory = hex_to_linear_rgba(BG_IVORY_HEX)
+    if bg is not None and wout is not None:
+        bg.inputs["Color"].default_value = ivory       # カメラに見える背景
+        bg.inputs["Strength"].default_value = 1.0
+        light_bg = wn.new("ShaderNodeBackground"); light_bg.name = "OW_BG_Light"
+        light_bg.inputs["Color"].default_value = (0.72, 0.74, 1.0, 1.0)  # 照明: 青寄りの環境光
+        light_bg.inputs["Strength"].default_value = WORLD_LIGHT_STRENGTH
+        lp = wn.new("ShaderNodeLightPath")
+        mix = wn.new("ShaderNodeMixShader")
+        wl.new(lp.outputs["Is Camera Ray"], mix.inputs["Fac"])
+        wl.new(light_bg.outputs["Background"], mix.inputs[1])
+        wl.new(bg.outputs["Background"], mix.inputs[2])
+        wl.new(mix.outputs["Shader"], wout.inputs["Surface"])
     return made
 
 
@@ -947,47 +1229,73 @@ def _key_loc(obj, frame, loc):
 
 
 def create_cameras(coll, cfg, meta) -> dict:
+    """カメラはフィールドのローカル座標で設計し、フィールド回転(7°)を掛けて配置。"""
     ang = meta["field_rot"]
-    channel_x = meta["channel_x"]
+    cx = meta["channel_x"]
+    mh = cfg["max_height"]
     total_smoothed = 0
 
-    # ---- CAM_06 EMERGENCE : 38mm, 後退・高め・右奥へ非対称 ----
-    tgt06 = _add_empty(coll, TARGET_06, (*_rot2d(4.0, 4.0, ang), 3.5))
-    cam06 = _add_camera(coll, CAM_EMERGENCE, 38.0)
-    _track_to(cam06, tgt06)
-    _key_loc(cam06, SHOT_EMERGENCE[0], (4.0, -37.0, 10.0))   # 開始: 余白を残す
-    _key_loc(cam06, SHOT_EMERGENCE[1], (1.0, -31.0, 11.0))   # わずかにドリーイン
-    total_smoothed += _smooth_fcurves(cam06)
+    def W(lx, ly, z):
+        return (*_rot2d(lx, ly, ang), z)
 
-    # ---- CAM_07 DIVE : 24mm, データチャネル内部を通過 ----
-    cam07 = _add_camera(coll, CAM_DIVE, 24.0)
-    tgt_dive = _add_empty(coll, TARGET_DIVE, (*_rot2d(channel_x, -6.0, ang), 3.2))
+    # ---- CAM_06 EMERGENCE : 32mm, 地表近くから中央の立ち上がりを見る ----
+    tgt06 = _add_empty(coll, TARGET_06, W(0.0, 2.0, mh * 0.40))
+    cam06 = _add_camera(coll, CAM_EMERGENCE, 32.0)
+    _track_to(cam06, tgt06)
+    _key_loc(cam06, SHOT_EMERGENCE[0], W(4.0, -31.0, mh * 0.50))
+    _key_loc(cam06, SHOT_EMERGENCE[1], W(3.0, -27.5, mh * 0.45))  # わずかにドリーイン
+    total_smoothed += _smooth_fcurves(cam06)
+    cam06.data.dof.focus_object = tgt06
+    cam06.data.dof.aperture_fstop = 1.2
+
+    # ---- CAM_07 DIVE : 22mm, 壁に挟まれたデータチャネルを低く高速に抜ける ----
+    fly_z = mh * 0.24
+    cam07 = _add_camera(coll, CAM_DIVE, 22.0)
+    tgt_dive = _add_empty(coll, TARGET_DIVE, W(cx, -16.0, fly_z * 0.85))
     _track_to(cam07, tgt_dive)
-    fly_z = 3.6  # ブロック内部（2.5〜5.0）
-    for fr, ly in ((SHOT_DIVE[0], -18.0),
-                   ((SHOT_DIVE[0] + SHOT_DIVE[1]) // 2, 0.0),
-                   (SHOT_DIVE[1], 18.0)):
-        wx, wy = _rot2d(channel_x, ly, ang)
-        _key_loc(cam07, fr, (wx, wy, fly_z))
-    total_smoothed += _smooth_fcurves(cam07)  # Bezier=中盤加速/前後減速
-    # 注視点は常に前方へ先行
-    _key_loc(tgt_dive, SHOT_DIVE[0], (*_rot2d(channel_x, -6.0, ang), 3.2))
-    _key_loc(tgt_dive, SHOT_DIVE[1], (*_rot2d(channel_x, 30.0, ang), 2.8))
+    for fr, ly in ((SHOT_DIVE[0], -30.0),
+                   ((SHOT_DIVE[0] + SHOT_DIVE[1]) // 2, -14.0),
+                   (SHOT_DIVE[1], 6.0)):
+        _key_loc(cam07, fr, W(cx, ly, fly_z))
+    total_smoothed += _smooth_fcurves(cam07)
+    _key_loc(tgt_dive, SHOT_DIVE[0], W(cx, -16.0, fly_z * 0.85))  # 注視点は常に前方
+    _key_loc(tgt_dive, SHOT_DIVE[1], W(cx, 24.0, fly_z * 0.80))
     total_smoothed += _smooth_fcurves(tgt_dive)
 
-    # ---- CAM_08 HERO : 42mm, 右から左奥を見る・右に余白 ----
-    tgt08 = _add_empty(coll, TARGET_08, (*_rot2d(-2.0, 2.0, ang), 4.0))
-    cam08 = _add_camera(coll, CAM_HERO, 42.0)
+    # ---- CAM_08 HERO : 40mm, 上昇しながら後退し全景へ ----
+    tgt08 = _add_empty(coll, TARGET_08, W(-2.0, 8.0, mh * 0.15))
+    cam08 = _add_camera(coll, CAM_HERO, 40.0)
     _track_to(cam08, tgt08)
-    _key_loc(cam08, SHOT_HERO[0], (13.0, -19.0, 11.0))
-    _key_loc(cam08, SHOT_HERO[1], (18.0, -44.0, 22.0))   # 上昇+後退
+    _key_loc(cam08, SHOT_HERO[0], W(8.0, -30.0, mh * 1.6))
+    _key_loc(cam08, SHOT_HERO[1], W(10.0, -44.0, mh * 2.9))
     total_smoothed += _smooth_fcurves(cam08)
     cam08.data.dof.focus_object = tgt08
-    cam08.data.dof.aperture_fstop = 4.0
+    cam08.data.dof.aperture_fstop = 5.6
 
-    log.info("カメラ生成: 06(38mm) 07(24mm/dive) 08(42mm/hero), "
-             "フィールド回転=%.1f°, F-Curve補間設定=%d本", FIELD_ROT_Z_DEG, total_smoothed)
+    log.info("カメラ生成(v3): 06(32mm) 07(22mm/dive z=%.2f) 08(40mm/hero), "
+             "フィールド回転=%.1f°, F-Curve補間設定=%d本",
+             fly_z, FIELD_ROT_Z_DEG, total_smoothed)
     return {"emergence": cam06, "dive": cam07, "hero": cam08}
+
+
+def key_fog_per_shot(block_mat) -> None:
+    """霞の距離をショット境界でキー（CONSTANT）。1本のアニメ描画でも各カメラに合う。"""
+    fog = block_mat.node_tree.nodes.get(FOG_NODE_NAME)
+    if fog is None:
+        log.warning("霞ノードが見つからないためショット別の霞をスキップします。")
+        return
+    for key, (start, _end) in (("06", SHOT_EMERGENCE), ("07", SHOT_DIVE), ("08", SHOT_HERO)):
+        f0, f1 = FOG_PER_SHOT[key]
+        fog.inputs["From Min"].default_value = f0
+        fog.inputs["From Max"].default_value = f1
+        fog.inputs["From Min"].keyframe_insert("default_value", frame=start)
+        fog.inputs["From Max"].keyframe_insert("default_value", frame=start)
+    n = 0
+    for fc in _iter_action_fcurves(block_mat.node_tree):
+        for kp in fc.keyframe_points:
+            kp.interpolation = "CONSTANT"
+            n += 1
+    log.info("霞(ショット別): %s / キー %d 個(CONSTANT)", FOG_PER_SHOT, n)
 
 
 def setup_markers(cams: dict) -> None:
@@ -1029,7 +1337,54 @@ def setup_scene_base(cfg) -> str:
     scene.render.resolution_x = RES_X
     scene.render.resolution_y = RES_Y
     _apply_image_format(scene, cfg, transparent=True)
+    setup_color_management(scene)
+    setup_bloom(scene)
     return engine
+
+
+def setup_color_management(scene) -> None:
+    """AgX は彩度が落ちるため Standard に固定（電気的ブルーを保つ）。"""
+    vs = scene.view_settings
+    for attr, val in (("view_transform", "Standard"), ("look", "None")):
+        try:
+            setattr(vs, attr, val)
+        except (TypeError, ValueError) as exc:
+            log.warning("色管理 %s=%s を設定できません: %s", attr, val, exc)
+    vs.exposure = 0.0
+    vs.gamma = 1.0
+    log.info("色管理: view_transform=%s look=%s", vs.view_transform, vs.look)
+
+
+def setup_bloom(scene) -> None:
+    """発光部のにじみ（Glare/Bloom）。Blender 5 のコンポジタ(ノードグループ)方式。
+
+    設定できない版では警告のみでスキップ（レンダー自体は続行）。
+    """
+    if not hasattr(scene, "compositing_node_group"):
+        log.warning("このBlenderでは compositing_node_group が無いためブルームを省略します。")
+        return
+    name = PREFIX + "Compositor"
+    ng = bpy.data.node_groups.get(name) or bpy.data.node_groups.new(name, "CompositorNodeTree")
+    ng.nodes.clear()
+    if not any(getattr(i, "in_out", "") == "OUTPUT" for i in ng.interface.items_tree):
+        ng.interface.new_socket(name="Image", in_out="OUTPUT", socket_type="NodeSocketColor")
+    rl = ng.nodes.new("CompositorNodeRLayers"); rl.location = (-300, 0)
+    gl = ng.nodes.new("CompositorNodeGlare"); gl.location = (0, 0)
+    out = ng.nodes.new("NodeGroupOutput"); out.location = (300, 0)
+    try:
+        gl.inputs["Type"].default_value = "Bloom"
+    except (TypeError, ValueError):
+        pass
+    for key, val in (("Threshold", 1.1), ("Strength", 0.35), ("Size", 0.5),
+                     ("Saturation", 1.0)):
+        if key in gl.inputs:
+            gl.inputs[key].default_value = val
+    ng.links.new(rl.outputs["Image"], gl.inputs["Image"])
+    ng.links.new(gl.outputs["Image"], out.inputs[0])
+    scene.compositing_node_group = ng
+    if hasattr(scene.render, "use_compositing"):
+        scene.render.use_compositing = True
+    log.info("ブルーム: %s (Glare/%s)", name, gl.inputs["Type"].default_value)
 
 
 def apply_preview_settings(cfg) -> None:
@@ -1037,9 +1392,14 @@ def apply_preview_settings(cfg) -> None:
     scene.render.resolution_percentage = int(cfg["preview_resolution_percentage"])
     ee = getattr(scene, "eevee", None)
     if ee is not None and hasattr(ee, "taa_render_samples"):
-        ee.taa_render_samples = 16
-    _set_motion_blur(scene, False)
+        ee.taa_render_samples = 32 if LOOKDEV_PREVIEW else 16
+    _set_motion_blur(scene, LOOKDEV_PREVIEW)
     _set_dof_all(False)
+    if LOOKDEV_PREVIEW:  # 見た目確認用: 被写界深度も最終と同じにする
+        for name in (CAM_EMERGENCE, CAM_HERO):
+            cam = bpy.data.objects.get(name)
+            if cam is not None:
+                cam.data.dof.use_dof = True
 
 
 def apply_final_settings(cfg) -> None:
@@ -1050,9 +1410,10 @@ def apply_final_settings(cfg) -> None:
         ee.taa_render_samples = 128
     _set_motion_blur(scene, True)
     _set_dof_all(False)
-    hero = bpy.data.objects.get(CAM_HERO)
-    if hero is not None:
-        hero.data.dof.use_dof = True
+    for name in (CAM_EMERGENCE, CAM_HERO):
+        cam = bpy.data.objects.get(name)
+        if cam is not None:
+            cam.data.dof.use_dof = True
 
 
 def _set_motion_blur(scene, on: bool) -> None:
@@ -1093,7 +1454,7 @@ def _set_preview_ivory_bg():
     if world and world.use_nodes:
         bg = world.node_tree.nodes.get("Background")
         if bg is not None:
-            bg.inputs["Color"].default_value = (0.96, 0.93, 0.86, 1.0)  # 暖かいアイボリー
+            bg.inputs["Color"].default_value = hex_to_linear_rgba(BG_IVORY_HEX)  # 暖かいアイボリー
             bg.inputs["Strength"].default_value = 1.0
 
 
@@ -1112,7 +1473,7 @@ def _restore_bg(snap):
 # プレビュー / ショットレンダー                                                  #
 # --------------------------------------------------------------------------- #
 SHOT_TABLE = {
-    "06": {"cam": CAM_EMERGENCE, "range": SHOT_EMERGENCE, "preview_frame": 26},
+    "06": {"cam": CAM_EMERGENCE, "range": SHOT_EMERGENCE, "preview_frame": 24},
     "07": {"cam": CAM_DIVE, "range": SHOT_DIVE, "preview_frame": 48},
     "08": {"cam": CAM_HERO, "range": SHOT_HERO, "preview_frame": 96},
 }
@@ -1190,7 +1551,7 @@ def log_summary(cfg, dirs, cams, engine, instance_count) -> None:
     coll = bpy.data.collections.get(COLLECTION_NAME)
     obj_count = len(coll.objects) if coll else 0
     approx_red = int(round(instance_count * cfg["red_ratio"]))
-    log.info("================ OUTPUT_WORLD 完了サマリー (v2) ================")
+    log.info("================ OUTPUT_WORLD 完了サマリー (v3) ================")
     log.info("Blender          : %s", bpy.app.version_string)
     log.info("Collection       : %s (オブジェクト数 %d)", COLLECTION_NAME, obj_count)
     log.info("インスタンス数   : %d (%dx%d, 個別オブジェクトではない)",
@@ -1224,7 +1585,7 @@ def build(do_previews: bool = True, v2: bool = True) -> None:
     base_out = os.path.join(script_dir(), "output")
     dirs = ensure_dirs(base_out)
 
-    log.info("Blender %s / OUTPUT_WORLD 構築(v2)を開始します。", bpy.app.version_string)
+    log.info("Blender %s / OUTPUT_WORLD 構築(v3)を開始します。", bpy.app.version_string)
 
     backup_existing_blend(dirs)
     purge_previous()
@@ -1233,13 +1594,15 @@ def build(do_previews: bool = True, v2: bool = True) -> None:
     source = create_source_cube(coll)                 # 角丸Cube 1個（隠しソース）
     block_mat = create_block_material(cfg)
     assign_block_material_to_source(source, block_mat)  # ★ マテリアル継承の修正
-    field, meta = create_field_object(coll, cfg)      # GN でインスタンス化
+    accent_mat = create_accent_material()
+    field, meta = create_field_object(coll, cfg, accent_mat, block_mat)  # GN でインスタンス化
     orbs = create_hero_orbs(coll, cfg, meta)
     if orbs:
         create_data_lines(coll, cfg, meta, orbs[0])
     create_lights(coll, cfg)
     cams = create_cameras(coll, cfg, meta)
     setup_markers(cams)
+    key_fog_per_shot(block_mat)
 
     engine = setup_scene_base(cfg)
     bpy.context.scene.camera = cams["emergence"]
