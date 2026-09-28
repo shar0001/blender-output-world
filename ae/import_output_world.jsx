@@ -68,7 +68,7 @@
         if (guess.exists) { renderDir = guess; }
     } catch (e) { /* 手動選択へ */ }
     if (renderDir === null) {
-        renderDir = Folder.selectDialog("output/render フォルダを選んでください（01_CONNECT などが入っている場所）");
+        renderDir = Folder.selectDialog("output/render フォルダを選んでください（01_CONNECT〜09_FINISH が入っている場所）。まだ書き出していない場合はキャンセル");
         if (renderDir === null) { return; }
     }
 
@@ -81,6 +81,19 @@
         if (files.length === 0) { return null; }
         files.sort(function (a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
         return { file: files[0], count: files.length };
+    }
+
+    // ---- 連番が1本も無ければ、何も作らずに終了 -----------------------
+    var available = 0;
+    for (var k = 0; k < SHOTS.length; k++) {
+        if (firstFrameFile(SHOTS[k][0]) !== null) { available++; }
+    }
+    if (available === 0) {
+        alert("連番が見つかりませんでした。何も変更していません。\n\n選んだフォルダ:\n" + renderDir.fsName +
+              "\n\n先に Blender で render_final.py を実行して、\n" +
+              "output/render/01_CONNECT 〜 09_FINISH を書き出してください。\n" +
+              "そのあと output/render フォルダを選び直してください。");
+        return;
     }
 
     // ---- 読み込みとコンポ作成 ---------------------------------------
