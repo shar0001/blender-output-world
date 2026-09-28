@@ -445,8 +445,32 @@ def create_source_cube(coll) -> "bpy.types.Object":
 # --------------------------------------------------------------------------- #
 # マテリアル                                                                    #
 # --------------------------------------------------------------------------- #
+def _ensure_material_nodes(mat):
+    """Principled BSDF と Material Output を確実に用意して返す。
+
+    Blender のバージョンによって、新規マテリアルに既定ノードが入っていない/
+    名前が違う場合がある（5.1 で確認）。無ければ作ってつなぐ。
+    """
+    try:
+        mat.use_nodes = True
+    except (AttributeError, TypeError):
+        pass
+    nt = mat.node_tree
+    bsdf = next((n for n in nt.nodes if n.type == "BSDF_PRINCIPLED"), None)
+    out = next((n for n in nt.nodes if n.type == "OUTPUT_MATERIAL"), None)
+    if bsdf is None:
+        bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (0, 0)
+    if out is None:
+        out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (400, 0)
+    bsdf.name = "Principled BSDF"
+    out.name = "Material Output"
+    if not out.inputs["Surface"].is_linked:
+        nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    return bsdf, out
+
+
 def _principled(mat):
-    return mat.node_tree.nodes.get("Principled BSDF")
+    return _ensure_material_nodes(mat)[0]
 
 
 def _mix_rgba(nt, loc, fac_socket, color1, color2):
@@ -485,8 +509,7 @@ def create_block_material(cfg) -> "bpy.types.Material":
     mat.use_nodes = True
     nt = mat.node_tree
     nodes, links = nt.nodes, nt.links
-    bsdf = _principled(mat)
-    out = nodes.get("Material Output")
+    bsdf, out = _ensure_material_nodes(mat)
 
     # --- 入力 ---
     tex = nodes.new("ShaderNodeTexCoord"); tex.location = (-1500, 300)
@@ -1483,8 +1506,7 @@ def create_core_material() -> "bpy.types.Material":
     mat.use_nodes = True
     nt = mat.node_tree
     nodes, links = nt.nodes, nt.links
-    bsdf = _principled(mat)
-    out = nodes.get("Material Output")
+    bsdf, out = _ensure_material_nodes(mat)
     bsdf.inputs["Base Color"].default_value = hex_to_linear_rgba("#DCD9FF")
     bsdf.inputs["Roughness"].default_value = 0.28
     if "Coat Weight" in bsdf.inputs:
@@ -1730,10 +1752,19 @@ def create_lights(coll, cfg) -> list:
 
     world = bpy.data.worlds.get(PREFIX + "World") or bpy.data.worlds.new(PREFIX + "World")
     bpy.context.scene.world = world
-    world.use_nodes = True
+    try:
+        world.use_nodes = True
+    except (AttributeError, TypeError):
+        pass
     wn, wl = world.node_tree.nodes, world.node_tree.links
-    bg = wn.get("Background")
-    wout = wn.get("World Output")
+    # バージョンにより既定ノードが無い/名前が違うことがあるので、種類で探して無ければ作る
+    bg = next((n for n in wn if n.type == "BACKGROUND" and n.name != "OW_BG_Light"), None)
+    wout = next((n for n in wn if n.type == "OUTPUT_WORLD"), None)
+    if bg is None:
+        bg = wn.new("ShaderNodeBackground")
+    if wout is None:
+        wout = wn.new("ShaderNodeOutputWorld")
+    bg.name = "Background"  # プレビュー用の背景切替はこの名前で探す
     ivory = hex_to_linear_rgba(BG_IVORY_HEX)
     if bg is not None and wout is not None:
         bg.inputs["Color"].default_value = ivory       # カメラに見える背景
@@ -2046,7 +2077,7 @@ def _snapshot_bg():
     scene = bpy.context.scene
     world = scene.world
     snap = {"transparent": scene.render.film_transparent, "color": None, "strength": None}
-    if world and world.use_nodes:
+    if world and world.node_tree is not None:
         bg = world.node_tree.nodes.get("Background")
         if bg is not None:
             snap["color"] = tuple(bg.inputs["Color"].default_value)
@@ -2059,7 +2090,7 @@ def _set_preview_ivory_bg():
     scene = bpy.context.scene
     scene.render.film_transparent = False
     world = scene.world
-    if world and world.use_nodes:
+    if world and world.node_tree is not None:
         bg = world.node_tree.nodes.get("Background")
         if bg is not None:
             bg.inputs["Color"].default_value = hex_to_linear_rgba(BG_IVORY_HEX)  # 暖かいアイボリー
@@ -2070,7 +2101,7 @@ def _restore_bg(snap):
     scene = bpy.context.scene
     scene.render.film_transparent = snap["transparent"]
     world = scene.world
-    if world and world.use_nodes and snap["color"] is not None:
+    if world and world.node_tree is not None and snap["color"] is not None:
         bg = world.node_tree.nodes.get("Background")
         if bg is not None:
             bg.inputs["Color"].default_value = snap["color"]
