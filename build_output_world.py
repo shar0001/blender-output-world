@@ -95,7 +95,9 @@ CAM_FINISH = PREFIX + "CAM_09_FINISH"
 TARGET_PRELUDE = PREFIX + "TARGET_CORE"
 TARGET_FINISH = PREFIX + "TARGET_09"
 MAT_CORE_NAME = PREFIX + "Mat_Core"
-PRELUDE_CENTER = (0.0, 80.0, 40.0)  # 01〜05 はフィールドから離れた上空で撮る
+PRELUDE_CENTER = (0.0, 80.0, 40.0)
+NET_WOBBLE = 0.22          # ネットワークの点のゆらぎ量（m）
+PULSE_EDGE_RATIO = 0.45    # 光の粒が走る線の割合  # 01〜05 はフィールドから離れた上空で撮る
 
 # フィールドをグリッド軸から少し回す（黒い溝を目立たなくする, 5〜9°）
 FIELD_ROT_Z_DEG = 7.0
@@ -1248,15 +1250,25 @@ def _key_mod(obj, mod, ident, frame, value):
     obj.keyframe_insert(data_path=f'modifiers["{mod.name}"]["{ident}"]', frame=frame)
 
 
-def _build_radial_gn(name, line_mat, dot_mat=None):
+def _build_radial_gn(name, line_mat, dot_mat=None, pulse_mat=None, animated=False):
     """位置を中心から Scale 倍し、辺を細いチューブ、頂点をドットにする GN。
 
-    戻り値: (node_group, {"Scale": id, "DotScale": id, "LineRadius": id})
+    animated=True（ネットワーク用）では点ごとの動きを加える:
+      * 時間差のある収縮/爆発（点ごとに Scale の効き方を変える）
+      * ノイズによるゆらぎ（線も一緒に伸び縮みする）
+      * ドットのまたたき
+      * 線の上を外→中心へ走る光の粒（Pulse 入力で表示量を制御）
+    点の数は常に一定（表示/非表示は大きさで行う）。
+
+    戻り値: (node_group, {"Scale": id, "DotScale": id, "LineRadius": id, ...})
     """
     ng = bpy.data.node_groups.new(name, "GeometryNodeTree")
     new_interface_socket(ng, "Geometry", "INPUT", "NodeSocketGeometry")
     ids = {}
-    for sock_name, default in (("Scale", 1.0), ("DotScale", 1.0), ("LineRadius", 0.006)):
+    socks = [("Scale", 1.0), ("DotScale", 1.0), ("LineRadius", 0.006)]
+    if animated:
+        socks += [("Wobble", NET_WOBBLE), ("Pulse", 0.0)]
+    for sock_name, default in socks:
         item = new_interface_socket(ng, sock_name, "INPUT", "NodeSocketFloat")
         if hasattr(item, "default_value"):
             item.default_value = default
@@ -1269,10 +1281,35 @@ def _build_radial_gn(name, line_mat, dot_mat=None):
     pos = nodes.new("GeometryNodeInputPosition"); pos.location = (-700, -200)
     scl = nodes.new("ShaderNodeVectorMath"); scl.operation = "SCALE"; scl.location = (-520, -200)
     links.new(pos.outputs["Position"], scl.inputs[0])
-    links.new(n_in.outputs["Scale"], scl.inputs["Scale"])
     setp = nodes.new("GeometryNodeSetPosition"); setp.location = (-340, 0)
     links.new(n_in.outputs["Geometry"], setp.inputs["Geometry"])
     links.new(scl.outputs["Vector"], setp.inputs["Position"])
+    stime = nodes.new("GeometryNodeInputSceneTime"); stime.location = (-900, -700)
+    frame = stime.outputs["Frame"]
+    vidx = nodes.new("GeometryNodeInputIndex"); vidx.location = (-900, -560)
+    if animated:
+        # 時間差: 点ごとに Scale^e（e が大きい点ほど早く中心へ吸い込まれ、爆発では遠くへ飛ぶ）
+        expo = _random_float(ng, (-700, -420), 17, vidx.outputs["Index"], 0.7, 1.5)
+        ps = _M(ng, "POWER", (-520, -380), n_in.outputs["Scale"], expo)
+        links.new(ps, scl.inputs["Scale"])
+        # ゆらぎ: 4D ノイズ（時間で変化）。収縮しきった後は揺れない（振幅 × min(Scale,1)）
+        wn = nodes.new("ShaderNodeTexNoise"); wn.location = (-700, -860)
+        wn.noise_dimensions = "4D"
+        wn.inputs["Scale"].default_value = 0.35
+        wn.inputs["Detail"].default_value = 1.0
+        links.new(pos.outputs["Position"], wn.inputs["Vector"])
+        links.new(_M(ng, "MULTIPLY", (-860, -900), frame, 0.035), wn.inputs["W"])
+        ctr = nodes.new("ShaderNodeVectorMath"); ctr.operation = "SUBTRACT"; ctr.location = (-520, -860)
+        ctr.inputs[1].default_value = (0.5, 0.5, 0.5)
+        links.new(wn.outputs["Color"], ctr.inputs[0])
+        amp = _M(ng, "MULTIPLY", (-520, -1000), n_in.outputs["Wobble"],
+                 _M(ng, "MINIMUM", (-700, -1040), n_in.outputs["Scale"], 1.0))
+        off = nodes.new("ShaderNodeVectorMath"); off.operation = "SCALE"; off.location = (-340, -860)
+        links.new(ctr.outputs["Vector"], off.inputs[0])
+        links.new(amp, off.inputs["Scale"])
+        links.new(off.outputs["Vector"], setp.inputs["Offset"])
+    else:
+        links.new(n_in.outputs["Scale"], scl.inputs["Scale"])
 
     join = nodes.new("GeometryNodeJoinGeometry"); join.location = (700, 0)
 
@@ -1307,14 +1344,93 @@ def _build_radial_gn(name, line_mat, dot_mat=None):
         hub_mul.node.inputs[2].default_value = 1.0
         sz = _M(ng, "MULTIPLY", (380, -500), rnd, hub_mul)
         sz = _M(ng, "MULTIPLY", (540, -500), sz, n_in.outputs["DotScale"])
+        if animated:  # またたき: 点ごとに位相の違う脈動
+            ph = _random_float(ng, (220, -760), 29, idx.outputs["Index"], 0.0, 6.283)
+            wave = _M(ng, "SINE", (540, -760), _M(ng, "MULTIPLY_ADD", (380, -760), frame, 0.32), None)
+            wave.node.inputs[0].links[0].from_node.inputs[2].default_value = 0.0
+            links.new(ph, wave.node.inputs[0].links[0].from_node.inputs[2])
+            tw = _M(ng, "MULTIPLY_ADD", (700, -760), wave, 0.32)
+            tw.node.inputs[2].default_value = 0.85
+            sz = _M(ng, "MULTIPLY", (700, -500), sz, tw)
         iop = nodes.new("GeometryNodeInstanceOnPoints"); iop.location = (540, -200)
         links.new(m2p.outputs["Points"], iop.inputs["Points"])
         links.new(dm.outputs["Geometry"], iop.inputs["Instance"])
         links.new(sz, iop.inputs["Scale"])
         links.new(iop.outputs["Instances"], join.inputs[0])
 
+    if animated and pulse_mat is not None:
+        _add_edge_pulses(ng, setp.outputs["Geometry"], join, frame, n_in.outputs["Pulse"], pulse_mat)
+
     links.new(join.outputs["Geometry"], n_out.inputs[0])
     return ng, ids
+
+
+def _add_edge_pulses(ng, geo, join, frame, pulse_amt, pulse_mat):
+    """線（辺）の一部に、外側の端から中心側の端へ走る光の粒を載せる。"""
+    nodes, links = ng.nodes, ng.links
+    ev = nodes.new("GeometryNodeInputMeshEdgeVertices"); ev.location = (-120, -1200)
+    g1 = nodes.new("GeometryNodeStoreNamedAttribute"); g1.location = (60, -1100)
+    g1.data_type = "FLOAT_VECTOR"; g1.domain = "EDGE"
+    g1.inputs["Name"].default_value = "ow_p1"
+    links.new(geo, g1.inputs["Geometry"])
+    links.new(ev.outputs["Position 1"], next(i for i in g1.inputs if i.name == "Value" and i.type == "VECTOR"))
+    g2 = nodes.new("GeometryNodeStoreNamedAttribute"); g2.location = (220, -1100)
+    g2.data_type = "FLOAT_VECTOR"; g2.domain = "EDGE"
+    g2.inputs["Name"].default_value = "ow_p2"
+    links.new(g1.outputs["Geometry"], g2.inputs["Geometry"])
+    links.new(ev.outputs["Position 2"], next(i for i in g2.inputs if i.name == "Value" and i.type == "VECTOR"))
+    ep = nodes.new("GeometryNodeMeshToPoints"); ep.location = (380, -1100)
+    ep.mode = "EDGES"
+    links.new(g2.outputs["Geometry"], ep.inputs["Mesh"])
+
+    def named(nm, loc):
+        n = nodes.new("GeometryNodeInputNamedAttribute"); n.location = loc
+        n.data_type = "FLOAT_VECTOR"
+        n.inputs["Name"].default_value = nm
+        return next(o for o in n.outputs if o.name == "Attribute")
+    p1, p2 = named("ow_p1", (220, -1300)), named("ow_p2", (220, -1420))
+
+    def length(v, loc):
+        n = nodes.new("ShaderNodeVectorMath"); n.operation = "LENGTH"; n.location = loc
+        links.new(v, n.inputs[0])
+        return n.outputs["Value"]
+    p1_far = _M(ng, "GREATER_THAN", (540, -1360), length(p1, (380, -1300)), length(p2, (380, -1420)))
+
+    def vmix(fac, a, b, loc):
+        n = nodes.new("ShaderNodeMix"); n.data_type = "VECTOR"; n.location = loc
+        links.new(fac, next(i for i in n.inputs if i.name == "Factor" and i.type == "VALUE"))
+        links.new(a, next(i for i in n.inputs if i.name == "A" and i.type == "VECTOR"))
+        links.new(b, next(i for i in n.inputs if i.name == "B" and i.type == "VECTOR"))
+        return next(o for o in n.outputs if o.name == "Result" and o.type == "VECTOR")
+    start = vmix(p1_far, p2, p1, (700, -1300))   # 外側の端
+    end = vmix(p1_far, p1, p2, (700, -1420))     # 中心側の端
+
+    eidx = nodes.new("GeometryNodeInputIndex"); eidx.location = (380, -1560)
+    speed = _random_float(ng, (540, -1560), 41, eidx.outputs["Index"], 0.03, 0.07)
+    offs = _random_float(ng, (540, -1680), 43, eidx.outputs["Index"])
+    t = _M(ng, "FRACT", (860, -1600), _M(ng, "MULTIPLY_ADD", (700, -1600), frame, speed), None)
+    t.node.inputs[0].links[0].from_node.inputs[2].default_value = 0.0
+    links.new(offs, t.node.inputs[0].links[0].from_node.inputs[2])
+    pos_t = vmix(t, start, end, (1020, -1360))
+    sp = nodes.new("GeometryNodeSetPosition"); sp.location = (1180, -1100)
+    links.new(ep.outputs["Points"], sp.inputs["Geometry"])
+    links.new(pos_t, sp.inputs["Position"])
+
+    carry = _M(ng, "LESS_THAN", (860, -1760), _random_float(ng, (700, -1760), 47, eidx.outputs["Index"]),
+               PULSE_EDGE_RATIO)
+    fade = _M(ng, "SINE", (1020, -1720), _M(ng, "MULTIPLY", (860, -1840), t, math.pi), None)
+    size = _M(ng, "MULTIPLY", (1180, -1760), _M(ng, "MULTIPLY", (1020, -1840), carry, fade), pulse_amt)
+    ico = nodes.new("GeometryNodeMeshIcoSphere"); ico.location = (1180, -1300)
+    ico.inputs["Radius"].default_value = 0.032
+    ico.inputs["Subdivisions"].default_value = 1
+    pm = nodes.new("GeometryNodeSetMaterial"); pm.location = (1340, -1300)
+    pm.inputs["Material"].default_value = pulse_mat
+    links.new(ico.outputs["Mesh"], pm.inputs["Geometry"])
+    ip = nodes.new("GeometryNodeInstanceOnPoints"); ip.location = (1500, -1100)
+    links.new(sp.outputs["Geometry"], ip.inputs["Points"])
+    links.new(pm.outputs["Geometry"], ip.inputs["Instance"])
+    links.new(size, ip.inputs["Scale"])
+    links.new(ip.outputs["Instances"], join.inputs[0])
 
 
 def _network_mesh(name, seed, count, radius):
@@ -1421,7 +1537,8 @@ def create_prelude(coll, cfg) -> dict:
     net = bpy.data.objects.new(PREFIX + "Network", net_mesh)
     net.location = c
     link_to_world(coll, net)
-    ng_net, nid = _build_radial_gn(PREFIX + "GN_Network", line_mat, dot_mat)
+    pulse_mat = _emission_material(PREFIX + "Mat_NetPulse", "#7F88FF", 1.8)
+    ng_net, nid = _build_radial_gn(PREFIX + "GN_Network", line_mat, dot_mat, pulse_mat, animated=True)
     mn = net.modifiers.new(name="OW_Radial", type="NODES"); mn.node_group = ng_net
     for f, s_, d_, l_ in ((1, 1.0, 1.0, 0.006), (24, 0.80, 1.0, 0.006), (30, 0.70, 1.0, 0.005),
                           (46, 0.05, 0.25, 0.0012), (48, 0.03, 0.0, 0.0),
@@ -1430,6 +1547,9 @@ def create_prelude(coll, cfg) -> dict:
         _key_mod(net, mn, nid["Scale"], f, s_)
         _key_mod(net, mn, nid["DotScale"], f, d_)
         _key_mod(net, mn, nid["LineRadius"], f, l_)
+    # 光の粒: 01 で流れ始め、02 の収束とともに消える
+    for f, v in ((1, 0.0), (6, 1.0), (36, 1.0), (44, 0.0)):
+        _key_mod(net, mn, nid["Pulse"], f, v)
     _smooth_fcurves(net)
     _key_visible(net, SHOT_CONNECT[0], SHOT_RELEASE[1])
 
